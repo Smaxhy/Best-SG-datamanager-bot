@@ -28,13 +28,8 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_
 # If the JSON is supplied directly as an env var (for cloud hosts):
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
-# All player tabs the bot should search (comma-separated in env).
-# Default covers every player-containing tab in the spreadsheet.
-_DEFAULT_SHEETS = (
-    "[D] ROOK,[D] BASTION,[C] ANCILLARY,"
-    "[S] PEACEKEEPER,[U] MEDICAL,[U] RESEARCH,[U] CANNONEER,[U] VALKYRIE,"
-    "COMMAND,J. COMMAND,QUARTERMASTER,DEVICE WIELDERS"
-)
+# Player tabs to search (comma-separated in env).
+_DEFAULT_SHEETS = "[D] ROOK,[D] BASTION,[C] ANCILLARY"
 _SHEETS_RAW = os.getenv("PLAYER_SHEETS", _DEFAULT_SHEETS)
 DETACHMENT_SHEETS: list[str] = [s.strip() for s in _SHEETS_RAW.split(",") if s.strip()]
 
