@@ -6,7 +6,6 @@ Orchestrates: message fetch → parse → sheet lookup → update → record.
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -18,32 +17,6 @@ from services import database_service as db
 from services import sheets_service as sheets
 
 logger = logging.getLogger("bot.scan")
-
-# ── Detachment/unit/role labels that must never be treated as lore names ──
-_KNOWN_DETACHMENT_TOKENS = {
-    "ancillary", "rook", "bastion", "peacekeeper", "medical",
-    "research", "cannoneer", "valkyrie", "command", "j", "j.",
-    "quartermaster", "device", "wielders", "information",
-    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
-    "golf", "hotel", "india", "juliet", "kilo", "lima", "mike",
-    "november", "oscar", "papa", "quebec", "romeo", "sierra",
-    "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
-}
-
-
-def _is_detachment_label(text: str | None) -> bool:
-    """
-    Return True if *text* looks like a detachment/unit/role label
-    (e.g. "Rook", "Ancillary/Rook", "Bastion", "Rook Charlie")
-    rather than a real lore name.
-    """
-    if not text:
-        return False
-    t = text.strip().lower()
-    # Remove bracket prefixes like [d], [c], [u], [s]
-    t = re.sub(r"\[[a-z]\]\s*", "", t)
-    parts = [p for p in re.split(r"[\s/,&|]+", t) if p]
-    return any(p in _KNOWN_DETACHMENT_TOKENS for p in parts)
 
 
 def _extract_text(message: discord.Message) -> str:
@@ -109,16 +82,6 @@ async def run_scan(
 
         result.valid_logs += 1
 
-        # ── Skip logs where the parser picked up a detachment label as username ──
-        if (
-            parsed.username
-            and _is_detachment_label(parsed.username)
-            and (not parsed.lore_name or _is_detachment_label(parsed.lore_name))
-        ):
-            result.invalid_logs += 1
-            logger.info("Skipping detachment label as username: %r", parsed.username)
-            continue
-
         # ── Duplicate check ──────────────────────────────────────
         if await db.is_already_processed(message.id):
             result.already_processed += 1
@@ -142,26 +105,54 @@ async def run_scan(
             )
             continue
 
-        # ── Lore name validation ─────────────────────────────────
+        # ── Lore validation ────────────────────────────────────────
+        # Username is the primary identifier. Some logs can put rank or
+        # detachment text into parsed.lore_name (e.g. "Rook", "Ancillary",
+        # or "Rook Charlie"). Those values are metadata, not character names,
+        # and must not cause a false lore mismatch.
         if parsed.lore_name and player.lore_name:
-            log_lore = parsed.lore_name.strip().lower()
-            sheet_lore = player.lore_name.strip().lower()
+            import re
 
-            # If the log's "lore" is actually a detachment/unit label, ignore it.
-            if _is_detachment_label(log_lore):
-                logger.info(
-                    "Ignoring detachment/unit label in lore field: %r",
-                    parsed.lore_name,
+            def _norm_lore(value: str) -> str:
+                value = (
+                    value.replace("\u200b", " ")
+                    .replace("\ufeff", " ")
+                    .replace("\u2060", " ")
+                    .replace("\xa0", " ")
                 )
-            else:
-                log_tokens = [t for t in re.split(r"[\s/,&|]+", log_lore) if t]
-                sheet_tokens = [t for t in re.split(r"[\s/,&|]+", sheet_lore) if t]
+                return re.sub(r"\\s+", " ", value.strip().casefold())
 
+            log_lore = _norm_lore(parsed.lore_name)
+            sheet_lore = _norm_lore(player.lore_name)
+
+            metadata_words = {
+                "rook", "ancillary", "bastion", "peacekeeper", "medical",
+                "research", "cannoneer", "valkyrie", "command",
+                "j command", "quartermaster", "device wielder",
+                "device wielders",
+            }
+
+            metadata_parts = {
+                part.strip()
+                for part in re.split(r"[/|,;\\-]+", log_lore)
+                if part.strip()
+            }
+
+            looks_like_metadata = (
+                log_lore in metadata_words
+                or bool(metadata_parts & metadata_words)
+                or log_lore.startswith("rook ")
+                or log_lore.startswith("ancillary ")
+            )
+
+            # Only compare the lore field when it actually looks like a
+            # character name. Exact lore or an exact first-name match is
+            # accepted; arbitrary prefixes are no longer accepted.
+            if not looks_like_metadata:
+                sheet_parts = sheet_lore.split()
                 lore_ok = (
                     log_lore == sheet_lore
-                    or sheet_lore.startswith(log_lore + " ")
-                    or log_lore in sheet_tokens
-                    or any(tok in sheet_tokens for tok in log_tokens if len(tok) > 2)
+                    or (bool(sheet_parts) and log_lore == sheet_parts[0])
                 )
 
                 if not lore_ok:
