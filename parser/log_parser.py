@@ -32,9 +32,18 @@ MAX_MP_PER_LOG = 5
 # ── Compiled patterns (case-insensitive) ─────────────────────────────
 _RE_USERNAME = re.compile(r"username\s*:\s*(.+)", re.IGNORECASE)
 _RE_LORE     = re.compile(r"lore\s*name\s*:\s*(.+)", re.IGNORECASE)
-_RE_EP       = re.compile(r"\bEP\s*:?\s*([+-]?\d+)", re.IGNORECASE)
-_RE_TP       = re.compile(r"\bTP\s*:?\s*([+-]?\d+)", re.IGNORECASE)
-_RE_MP       = re.compile(r"\bMP\s*:?\s*([+-]?\d+)", re.IGNORECASE)
+
+# Match both "EP: 2" / "EP 2" AND "2 EP" / "2EP" (same line only)
+_RE_EP       = re.compile(r"(?:\bEP[ \t]*:?[ \t]*([+-]?\d+)|([+-]?\d+)[ \t]*EP\b)", re.IGNORECASE)
+_RE_TP       = re.compile(r"(?:\bTP[ \t]*:?[ \t]*([+-]?\d+)|([+-]?\d+)[ \t]*TP\b)", re.IGNORECASE)
+_RE_MP       = re.compile(r"(?:\bMP[ \t]*:?[ \t]*([+-]?\d+)|([+-]?\d+)[ \t]*MP\b)", re.IGNORECASE)
+
+
+def _extract_stat(match) -> int:
+    """Get the number from whichever group matched (group 1 or group 2)."""
+    if match is None:
+        return 0
+    return int(match.group(1) or match.group(2))
 
 # Lines to skip when guessing username/lore from unlabelled format
 _SKIP_PATTERNS = re.compile(
@@ -96,7 +105,7 @@ def parse_log(content: str) -> ParsedLog | None:
             if _SKIP_PATTERNS.match(stripped):
                 continue
             # Skip lines that are just stats like "EP: 2"
-            if re.match(r"^[A-Z]{2}\s*:?\s*[+-]?\d+$", stripped, re.IGNORECASE):
+            if re.match(r"^([+-]?\d+\s*[A-Z]{2}|[A-Z]{2}\s*:?\s*[+-]?\d+)$", stripped, re.IGNORECASE):
                 continue
             # Skip lines that look like labelled fields
             if re.match(r"^(username|lore\s*name)\s*:", stripped, re.IGNORECASE):
@@ -118,9 +127,9 @@ def parse_log(content: str) -> ParsedLog | None:
     if len(username.split()) > 4:
         return None
 
-    ep = int(m_ep.group(1)) if m_ep else 0
-    tp = int(m_tp.group(1)) if m_tp else 0
-    mp = int(m_mp.group(1)) if m_mp else 0
+    ep = _extract_stat(m_ep)
+    tp = _extract_stat(m_tp)
+    mp = _extract_stat(m_mp)
 
     # ── Apply per-log caps ───────────────────────────────────────
     ep = _clamp(ep, MAX_EP_PER_LOG)
