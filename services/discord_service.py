@@ -1,6 +1,17 @@
 """
 Core scan logic — called by the /scan slash command.
-Orchestrates: message fetch → parse → sheet lookup → update → record.
+
+Orchestrates:
+
+message fetch
+    ↓
+log parser
+    ↓
+username/lore/detachment lookup
+    ↓
+Google Sheets update
+    ↓
+database record
 """
 
 from __future__ import annotations
@@ -11,50 +22,74 @@ from datetime import datetime, timedelta, timezone
 import discord
 
 import config
-from models.player import ParsedLog, ScanResult
+from models.player import ScanResult
 from parser.log_parser import parse_log
 from services import database_service as db
 from services import sheets_service as sheets
 
+
 logger = logging.getLogger("bot.scan")
 
 
-def _extract_text(message: discord.Message) -> str:
-    """
-    Get all readable text from a message:
-    - Regular message content
-    - Embed descriptions
-    - Embed field names and values
-    """
-    parts = []
+# ─────────────────────────────────────────────────────────────
+# Extract Discord message text
+# ─────────────────────────────────────────────────────────────
 
-    # Regular text content
+def _extract_text(
+    message: discord.Message,
+) -> str:
+
+    parts: list[str] = []
+
+    # Normal message content.
     if message.content:
-        parts.append(message.content)
+        parts.append(
+            message.content
+        )
 
-    # Embeds (some bots post logs as embeds)
+    # Embed descriptions + fields.
     for embed in message.embeds:
+
         if embed.description:
-            parts.append(embed.description)
+            parts.append(
+                embed.description
+            )
+
         for field in embed.fields:
+
             if field.name and field.value:
-                parts.append(f"{field.name}: {field.value}")
+
+                parts.append(
+                    f"{field.name}: {field.value}"
+                )
 
     return "\n".join(parts)
 
+
+# ─────────────────────────────────────────────────────────────
+# Scan
+# ─────────────────────────────────────────────────────────────
 
 async def run_scan(
     channel: discord.TextChannel,
     dm_user: discord.Member,
 ) -> ScanResult:
-    """
-    Scan *channel* for logs in the last SCAN_HOURS, update sheets,
-    and return an aggregated ScanResult for the summary embed.
-    """
-    result = ScanResult(channel_name=channel.name)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=config.SCAN_HOURS)
 
+    result = ScanResult(
+        channel_name=channel.name
+    )
+
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(
+            hours=config.SCAN_HOURS
+        )
+    )
+
+    # ─────────────────────────────────────────────────────────
     # Create audit record
+    # ─────────────────────────────────────────────────────────
+
     scan_id = await db.create_scan_record(
         dm_id=dm_user.id,
         dm_name=str(dm_user),
@@ -64,130 +99,238 @@ async def run_scan(
 
     players_touched: set[str] = set()
 
-    async for message in channel.history(after=cutoff, oldest_first=True, limit=None):
+    # ─────────────────────────────────────────────────────────
+    # Read Discord history
+    # ─────────────────────────────────────────────────────────
+
+    async for message in channel.history(
+        after=cutoff,
+        oldest_first=True,
+        limit=None,
+    ):
+
         result.messages_checked += 1
 
-        # Skip bot messages
+        # Ignore bot messages.
         if message.author.bot:
             continue
 
-        # Extract text from content + embeds
-        full_text = _extract_text(message)
+        full_text = _extract_text(
+            message
+        )
+
         if not full_text:
             continue
 
-        parsed = parse_log(full_text)
+        # ─────────────────────────────────────────────────────
+        # Parse
+        # ─────────────────────────────────────────────────────
+
+        parsed = parse_log(
+            full_text
+        )
+
         if parsed is None:
             continue
 
         result.valid_logs += 1
 
-        # ── Duplicate check ──────────────────────────────────────
-        if await db.is_already_processed(message.id):
+        logger.info(
+            "Parsed log: username='%s', "
+            "lore='%s', detachment='%s', "
+            "EP=%d TP=%d MP=%d",
+            parsed.username,
+            parsed.lore_name or "",
+            parsed.detachment or "",
+            parsed.ep,
+            parsed.tp,
+            parsed.mp,
+        )
+
+        # ─────────────────────────────────────────────────────
+        # Duplicate Discord message check
+        # ─────────────────────────────────────────────────────
+
+        if await db.is_already_processed(
+            message.id
+        ):
+
             result.already_processed += 1
+
             continue
 
-        # ── Find player in sheets (pass lore name for disambiguation) ──
+        # ─────────────────────────────────────────────────────
+        # Find player
+        # ─────────────────────────────────────────────────────
+
         try:
-            player = await sheets.find_player(parsed.username, parsed.lore_name)
-        except Exception as exc:
-            logger.exception("Sheets error while looking up '%s'.", parsed.username)
-            result.errors += 1
-            result.flagged_messages.append(
-                f"⚠️ Google Sheets error for **{parsed.username}**: {exc}"
+
+            player = await sheets.find_player(
+                parsed.username,
+                parsed.lore_name,
+                parsed.detachment,
             )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Sheets error while looking up '%s'.",
+                parsed.username,
+            )
+
+            result.errors += 1
+
+            result.flagged_messages.append(
+                f"⚠️ Google Sheets error for "
+                f"**{parsed.username}**: {exc}"
+            )
+
             continue
+
+        # ─────────────────────────────────────────────────────
+        # No player
+        # ─────────────────────────────────────────────────────
 
         if player is None:
+
             result.players_not_found += 1
-            result.flagged_messages.append(
-                f"❌ Player not found — Username: **{parsed.username}**"
-            )
+
+            if parsed.detachment:
+
+                result.flagged_messages.append(
+                    f"❌ Player not found or ambiguous — "
+                    f"Username: **{parsed.username}** "
+                    f"| Detachment: **{parsed.detachment}**"
+                )
+
+            else:
+
+                result.flagged_messages.append(
+                    f"❌ Player not found or ambiguous — "
+                    f"Username: **{parsed.username}**"
+                )
+
             continue
 
-        # ── Lore validation ────────────────────────────────────────
-        # Username is the primary identifier. Some logs can put rank or
-        # detachment text into parsed.lore_name (e.g. "Rook", "Ancillary",
-        # or "Rook Charlie"). Those values are metadata, not character names,
-        # and must not cause a false lore mismatch.
-        if parsed.lore_name and player.lore_name:
-            import re
+        # ─────────────────────────────────────────────────────
+        # Lore validation
+        #
+        # Only validate if the parser actually found a lore name.
+        #
+        # Detachment/rank metadata does NOT reach this section.
+        # ─────────────────────────────────────────────────────
 
-            def _norm_lore(value: str) -> str:
-                value = (
-                    value.replace("\u200b", " ")
-                    .replace("\ufeff", " ")
-                    .replace("\u2060", " ")
-                    .replace("\xa0", " ")
-                )
-                return re.sub(r"\\s+", " ", value.strip().casefold())
+        if (
+            parsed.lore_name
+            and player.lore_name
+        ):
 
-            log_lore = _norm_lore(parsed.lore_name)
-            sheet_lore = _norm_lore(player.lore_name)
-
-            metadata_words = {
-                "rook", "ancillary", "bastion", "peacekeeper", "medical",
-                "research", "cannoneer", "valkyrie", "command",
-                "j command", "quartermaster", "device wielder",
-                "device wielders",
-            }
-
-            metadata_parts = {
-                part.strip()
-                for part in re.split(r"[/|,;\\-]+", log_lore)
-                if part.strip()
-            }
-
-            looks_like_metadata = (
-                log_lore in metadata_words
-                or bool(metadata_parts & metadata_words)
-                or log_lore.startswith("rook ")
-                or log_lore.startswith("ancillary ")
+            log_lore = (
+                parsed.lore_name
+                .strip()
+                .casefold()
             )
 
-            # Only compare the lore field when it actually looks like a
-            # character name. Exact lore or an exact first-name match is
-            # accepted; arbitrary prefixes are no longer accepted.
-            if not looks_like_metadata:
-                sheet_parts = sheet_lore.split()
-                lore_ok = (
-                    log_lore == sheet_lore
-                    or (bool(sheet_parts) and log_lore == sheet_parts[0])
+            sheet_lore = (
+                player.lore_name
+                .strip()
+                .casefold()
+            )
+
+            # Exact full lore match.
+            #
+            # Also allow exact first-name matching when the user
+            # genuinely entered a character name such as:
+            #
+            # Jessica
+            #
+            # This is ONLY validation after username lookup.
+            # It is NOT used to find a player.
+            sheet_parts = sheet_lore.split()
+
+            lore_ok = (
+                log_lore == sheet_lore
+                or (
+                    bool(sheet_parts)
+                    and log_lore == sheet_parts[0]
+                )
+            )
+
+            if not lore_ok:
+
+                result.lore_mismatches += 1
+
+                result.flagged_messages.append(
+                    f"⚠️ Lore mismatch for "
+                    f"**{parsed.username}** — "
+                    f"Sheet: *{player.lore_name}* / "
+                    f"Log: *{parsed.lore_name}*"
                 )
 
-                if not lore_ok:
-                    result.lore_mismatches += 1
-                    result.flagged_messages.append(
-                        f"⚠️ Lore mismatch for **{parsed.username}** — "
-                        f"Sheet: *{player.lore_name}* / Log: *{parsed.lore_name}*"
-                    )
-                    continue
+                logger.warning(
+                    "Lore mismatch: username='%s', "
+                    "sheet='%s', log='%s'",
+                    parsed.username,
+                    player.lore_name,
+                    parsed.lore_name,
+                )
 
-        # ── Validate rank (informational only) ───────────────────
-        if player.rank and player.rank.upper() not in config.VALID_RANKS:
+                continue
+
+        # ─────────────────────────────────────────────────────
+        # Validate sheet rank
+        # ─────────────────────────────────────────────────────
+
+        if (
+            player.rank
+            and player.rank.upper()
+            not in config.VALID_RANKS
+        ):
+
             logger.warning(
-                "Player %s has unexpected rank '%s' in sheet '%s'.",
-                player.username, player.rank, player.sheet_name,
+                "Player %s has unexpected rank "
+                "'%s' in sheet '%s'.",
+                player.username,
+                player.rank,
+                player.sheet_name,
             )
 
-        # ── Update Google Sheets ─────────────────────────────────
+        # ─────────────────────────────────────────────────────
+        # Update Google Sheets
+        # ─────────────────────────────────────────────────────
+
         try:
+
             await sheets.update_player_stats(
                 player,
                 ep_delta=parsed.ep,
                 tp_delta=parsed.tp,
                 mp_delta=parsed.mp,
             )
+
         except Exception as exc:
-            logger.exception("Failed to update sheets for '%s'.", parsed.username)
-            result.errors += 1
-            result.flagged_messages.append(
-                f"⚠️ Sheet update failed for **{parsed.username}**: {exc}"
+
+            logger.exception(
+                "Failed to update sheets "
+                "for '%s'.",
+                parsed.username,
             )
+
+            result.errors += 1
+
+            result.flagged_messages.append(
+                f"⚠️ Sheet update failed for "
+                f"**{parsed.username}**: {exc}"
+            )
+
             continue
 
-        # ── Record success (with crash protection) ───────────────
+        # ─────────────────────────────────────────────────────
+        # Record processed log
+        # ─────────────────────────────────────────────────────
+
         try:
+
             await db.record_processed_log(
                 message_id=message.id,
                 channel_id=channel.id,
@@ -200,23 +343,75 @@ async def run_scan(
                 mp=parsed.mp,
                 detachment=player.sheet_name,
             )
+
         except Exception:
-            logger.warning("Message %s already recorded — skipping.", message.id)
+
+            logger.warning(
+                "Message %s already recorded — "
+                "skipping.",
+                message.id,
+            )
+
             result.already_processed += 1
+
             continue
 
-        await db.increment_dm_score(dm_user.id, str(dm_user), logs=1)
+        # ─────────────────────────────────────────────────────
+        # Update DM score
+        # ─────────────────────────────────────────────────────
+
+        await db.increment_dm_score(
+            dm_user.id,
+            str(dm_user),
+            logs=1,
+        )
+
+        # ─────────────────────────────────────────────────────
+        # Update scan totals
+        # ─────────────────────────────────────────────────────
 
         result.new_processed += 1
+
         result.ep_added += parsed.ep
+
         result.tp_added += parsed.tp
+
         result.mp_added += parsed.mp
-        players_touched.add(parsed.username.lower())
 
-    result.players_updated = len(players_touched)
+        players_touched.add(
+            parsed.username.casefold()
+        )
 
-    # Finalise scan audit
-    await db.increment_dm_scans(dm_user.id, str(dm_user))
+        logger.info(
+            "SUCCESS: %s -> %s "
+            "(%s, row %d) "
+            "EP %+d TP %+d MP %+d",
+            parsed.username,
+            player.lore_name,
+            player.sheet_name,
+            player.row_index,
+            parsed.ep,
+            parsed.tp,
+            parsed.mp,
+        )
+
+    # ─────────────────────────────────────────────────────────
+    # Final totals
+    # ─────────────────────────────────────────────────────────
+
+    result.players_updated = len(
+        players_touched
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # Finish audit
+    # ─────────────────────────────────────────────────────────
+
+    await db.increment_dm_scans(
+        dm_user.id,
+        str(dm_user),
+    )
+
     await db.finish_scan_record(
         scan_id,
         messages_checked=result.messages_checked,
