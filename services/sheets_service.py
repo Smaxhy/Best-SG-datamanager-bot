@@ -1,14 +1,15 @@
 """
-Google Sheets service — finds players by header name, reads/writes stats.
+Google Sheets service — finds players by scanning for USERNAME headers
+across multi-section sheets (multiple squadrons per tab).
 
-Uses gspread_asyncio + google-auth for async, non-blocking access.
+Handles layouts where headers like RANK | USERNAME | LORE NAME | EP | TP | MP
+appear multiple times on the same sheet at different positions.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -40,75 +41,121 @@ def _get_credentials() -> Credentials:
 agcm = AsyncioGspreadClientManager(_get_credentials)
 
 
-# ── Internal helpers ─────────────────────────────────────────────────
-
-async def _get_worksheet(sheet_name: str) -> gspread.Worksheet:
+async def _get_worksheet(sheet_name: str):
     client = await agcm.authorize()
     ss = await client.open_by_key(config.GOOGLE_SPREADSHEET_ID)
     return await ss.worksheet(sheet_name)
 
 
-async def _header_map(ws) -> dict[str, int]:
-    """Return {lower-cased header: 0-based col index} for row 1."""
-    row = await ws.row_values(1)
-    return {cell.strip().lower(): idx for idx, cell in enumerate(row)}
+def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
+    """
+    Scan every cell in the sheet for rows containing 'USERNAME'.
+    For each match, map the surrounding headers (RANK, LORE NAME, EP, TP, MP).
+    Returns a list of table sections with header positions.
+    """
+    sections = []
+
+    for row_idx, row in enumerate(all_values):
+        for col_idx, cell in enumerate(row):
+            if cell.strip().upper() == "USERNAME":
+                # Found a USERNAME header — now map the rest of the headers in this row
+                header_map = {}
+                for c, val in enumerate(row):
+                    key = val.strip().upper()
+                    if key in ("RANK", "USERNAME", "LORE NAME", "EP", "TP", "MP", "PROMO"):
+                        header_map[key] = c
+
+                if "USERNAME" in header_map:
+                    sections.append({
+                        "header_row": row_idx,
+                        "headers": header_map,
+                    })
+
+    return sections
 
 
-# ── Public API ───────────────────────────────────────────────────────
+def _find_player_in_sections(
+    all_values: list[list[str]],
+    sections: list[dict],
+    target: str,
+) -> tuple[dict, int, list[str]] | None:
+    """
+    Search each section's data rows for the target username.
+    Returns (section, 1-based row index, row data) or None.
+    """
+    target_lower = target.lower()
+
+    for section in sections:
+        header_row = section["header_row"]
+        username_col = section["headers"]["USERNAME"]
+
+        # Walk rows below the header until we hit another header, empty area, or end
+        for row_idx in range(header_row + 1, len(all_values)):
+            row = all_values[row_idx]
+
+            # If this row contains "USERNAME" in any cell, we've hit the next section
+            if any(c.strip().upper() == "USERNAME" for c in row):
+                break
+
+            # Get the username cell
+            if username_col < len(row):
+                cell_val = row[username_col].strip()
+                if cell_val and cell_val.lower() == target_lower:
+                    return section, row_idx + 1, row  # +1 for 1-based gspread indexing
+
+    return None
+
 
 async def find_player(username: str) -> PlayerRow | None:
     """
     Search every detachment sheet for *username* (case-insensitive).
-    Returns the first match or None.
+    Handles multiple sections/squadrons per sheet.
     """
-    target = username.strip().lower()
+    target = username.strip()
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
             ws = await _get_worksheet(sheet_name)
-            headers = await _header_map(ws)
+            all_values = await ws.get_all_values()
 
-            col_username = headers.get("username")
-            if col_username is None:
-                logger.warning("Sheet '%s' has no 'Username' header — skipped.", sheet_name)
+            sections = _find_table_sections(all_values)
+            if not sections:
+                logger.debug("Sheet '%s' has no USERNAME headers — skipped.", sheet_name)
                 continue
 
-            all_values = await ws.get_all_values()
-            for row_idx, row in enumerate(all_values[1:], start=2):  # skip header
-                cell_val = row[col_username].strip() if col_username < len(row) else ""
-                if cell_val.lower() == target:
-                    # Resolve column positions
-                    col_lore = headers.get("lore name", headers.get("lorename"))
-                    col_rank = headers.get("rank")
-                    col_ep = headers.get("ep")
-                    col_tp = headers.get("tp")
-                    col_mp = headers.get("mp")
+            result = _find_player_in_sections(all_values, sections, target)
+            if result is None:
+                continue
 
-                    def _safe(idx: int | None, default: str = "") -> str:
-                        if idx is None:
-                            return default
-                        return row[idx].strip() if idx < len(row) else default
+            section, row_1based, row = result
+            headers = section["headers"]
 
-                    def _safe_int(idx: int | None) -> int:
-                        v = _safe(idx, "0")
-                        try:
-                            return int(v)
-                        except ValueError:
-                            return 0
+            def _safe(key: str, default: str = "") -> str:
+                col = headers.get(key)
+                if col is None or col >= len(row):
+                    return default
+                return row[col].strip() or default
 
-                    return PlayerRow(
-                        sheet_name=sheet_name,
-                        row_index=row_idx,
-                        username=row[col_username].strip(),  # preserve original case
-                        lore_name=_safe(col_lore),
-                        rank=_safe(col_rank),
-                        ep=_safe_int(col_ep),
-                        tp=_safe_int(col_tp),
-                        mp=_safe_int(col_mp),
-                        col_ep=col_ep if col_ep is not None else -1,
-                        col_tp=col_tp if col_tp is not None else -1,
-                        col_mp=col_mp if col_mp is not None else -1,
-                    )
+            def _safe_int(key: str) -> int:
+                v = _safe(key, "0")
+                try:
+                    return int(float(v))
+                except (ValueError, TypeError):
+                    return 0
+
+            return PlayerRow(
+                sheet_name=sheet_name,
+                row_index=row_1based,
+                username=row[headers["USERNAME"]].strip(),
+                lore_name=_safe("LORE NAME"),
+                rank=_safe("RANK"),
+                ep=_safe_int("EP"),
+                tp=_safe_int("TP"),
+                mp=_safe_int("MP"),
+                col_ep=headers.get("EP", -1),
+                col_tp=headers.get("TP", -1),
+                col_mp=headers.get("MP", -1),
+            )
 
         except gspread.exceptions.WorksheetNotFound:
             logger.warning("Worksheet '%s' not found in spreadsheet.", sheet_name)
@@ -126,19 +173,24 @@ async def update_player_stats(
     Raises on failure so the caller knows NOT to mark the log as processed.
     """
     ws = await _get_worksheet(player.sheet_name)
-    headers = await _header_map(ws)
 
     updates: list[gspread.Cell] = []
 
-    def _add(col_key: str, new_val: int) -> None:
-        col_idx = headers.get(col_key)
-        if col_idx is not None:
-            # gspread Cell is 1-indexed
-            updates.append(gspread.Cell(row=player.row_index, col=col_idx + 1, value=str(new_val)))
-
-    _add("ep", player.ep + ep_delta)
-    _add("tp", player.tp + tp_delta)
-    _add("mp", player.mp + mp_delta)
+    if player.col_ep >= 0:
+        updates.append(gspread.Cell(
+            row=player.row_index, col=player.col_ep + 1,
+            value=str(player.ep + ep_delta)
+        ))
+    if player.col_tp >= 0:
+        updates.append(gspread.Cell(
+            row=player.row_index, col=player.col_tp + 1,
+            value=str(player.tp + tp_delta)
+        ))
+    if player.col_mp >= 0:
+        updates.append(gspread.Cell(
+            row=player.row_index, col=player.col_mp + 1,
+            value=str(player.mp + mp_delta)
+        ))
 
     if updates:
         await ws.update_cells(updates, value_input_option="RAW")
