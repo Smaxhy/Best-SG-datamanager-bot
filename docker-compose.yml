@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist the SQLite database across container restarts
+      - bot-data:/app/data
+      # Mount service account file if using file-based auth
+      # - ./service_account.json:/app/service_account.json:ro
+
+volumes:
+  bot-data:
