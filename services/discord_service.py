@@ -1,6 +1,5 @@
 """
 Core scan logic — called by the /scan slash command.
-
 Orchestrates: message fetch → parse → sheet lookup → update → record.
 """
 
@@ -18,6 +17,30 @@ from services import database_service as db
 from services import sheets_service as sheets
 
 logger = logging.getLogger("bot.scan")
+
+
+def _extract_text(message: discord.Message) -> str:
+    """
+    Get all readable text from a message:
+    - Regular message content
+    - Embed descriptions
+    - Embed field names and values
+    """
+    parts = []
+
+    # Regular text content
+    if message.content:
+        parts.append(message.content)
+
+    # Embeds (some bots post logs as embeds)
+    for embed in message.embeds:
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            if field.name and field.value:
+                parts.append(f"{field.name}: {field.value}")
+
+    return "\n".join(parts)
 
 
 async def run_scan(
@@ -48,7 +71,12 @@ async def run_scan(
         if message.author.bot:
             continue
 
-        parsed = parse_log(message.content)
+        # Extract text from content + embeds
+        full_text = _extract_text(message)
+        if not full_text:
+            continue
+
+        parsed = parse_log(full_text)
         if parsed is None:
             continue
 
@@ -59,9 +87,9 @@ async def run_scan(
             result.already_processed += 1
             continue
 
-        # ── Find player in sheets ────────────────────────────────
+        # ── Find player in sheets (pass lore name for disambiguation) ──
         try:
-            player = await sheets.find_player(parsed.username)
+            player = await sheets.find_player(parsed.username, parsed.lore_name)
         except Exception as exc:
             logger.exception("Sheets error while looking up '%s'.", parsed.username)
             result.errors += 1
@@ -108,22 +136,26 @@ async def run_scan(
             result.flagged_messages.append(
                 f"⚠️ Sheet update failed for **{parsed.username}**: {exc}"
             )
-            # Do NOT mark as processed — next scan will retry
             continue
 
-        # ── Record success ───────────────────────────────────────
-        await db.record_processed_log(
-            message_id=message.id,
-            channel_id=channel.id,
-            dm_id=dm_user.id,
-            dm_name=str(dm_user),
-            username=parsed.username,
-            lore_name=parsed.lore_name,
-            ep=parsed.ep,
-            tp=parsed.tp,
-            mp=parsed.mp,
-            detachment=player.sheet_name,
-        )
+        # ── Record success (with crash protection) ───────────────
+        try:
+            await db.record_processed_log(
+                message_id=message.id,
+                channel_id=channel.id,
+                dm_id=dm_user.id,
+                dm_name=str(dm_user),
+                username=parsed.username,
+                lore_name=parsed.lore_name,
+                ep=parsed.ep,
+                tp=parsed.tp,
+                mp=parsed.mp,
+                detachment=player.sheet_name,
+            )
+        except Exception:
+            logger.warning("Message %s already recorded — skipping.", message.id)
+            result.already_processed += 1
+            continue
 
         await db.increment_dm_score(dm_user.id, str(dm_user), logs=1)
 
