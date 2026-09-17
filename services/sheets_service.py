@@ -1,6 +1,9 @@
 """
 Google Sheets service — finds players across multi-section sheets.
-Handles side-by-side squadrons by only mapping headers NEAR each USERNAME.
+Handles side-by-side squadrons by mapping headers directionally:
+  RANK is always LEFT of USERNAME
+  LORE NAME, EP, TP, MP are always RIGHT of USERNAME
+This prevents cross-section bleed.
 """
 
 from __future__ import annotations
@@ -45,28 +48,39 @@ async def _get_worksheet(sheet_name: str):
 
 def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
     """
-    Find every USERNAME header. For each one, only look at columns
-    within 7 columns to the left and right for related headers.
-    This prevents mixing up side-by-side squadrons.
+    Find every USERNAME header in the sheet.
+    For each one:
+      - Look LEFT (max 3 cols) for RANK
+      - Look RIGHT (max 8 cols) for LORE NAME, EP, TP, MP
+      - Stop looking right if we hit another USERNAME
     """
     sections = []
-    RANGE = 7  # max distance from USERNAME to look for other headers
 
     for row_idx, row in enumerate(all_values):
-        for col_idx, cell in enumerate(row):
-            if cell.strip().upper() != "USERNAME":
-                continue
+        # Find all USERNAME columns in this row
+        username_cols = [
+            c for c, cell in enumerate(row)
+            if cell.strip().upper() == "USERNAME"
+        ]
 
-            # Only scan nearby columns for this section's headers
-            headers = {"USERNAME": col_idx}
-            left = max(0, col_idx - RANGE)
-            right = min(len(row), col_idx + RANGE + 1)
+        for ucol in username_cols:
+            headers = {"USERNAME": ucol}
 
-            for c in range(left, right):
+            # Look LEFT for RANK (max 3 cols)
+            for c in range(ucol - 1, max(-1, ucol - 4), -1):
+                if c >= 0 and c < len(row):
+                    v = row[c].strip().upper()
+                    if v == "RANK":
+                        headers["RANK"] = c
+                        break
+
+            # Look RIGHT for LORE NAME, EP, TP, MP (max 8 cols)
+            # Stop if we hit another USERNAME
+            for c in range(ucol + 1, min(len(row), ucol + 9)):
                 v = row[c].strip().upper()
-                if v == "RANK" and "RANK" not in headers:
-                    headers["RANK"] = c
-                elif v in ("LORE NAME", "LORENAME", "LORE") and "LORE NAME" not in headers:
+                if v == "USERNAME":
+                    break  # hit next section
+                if v in ("LORE NAME", "LORENAME", "LORE") and "LORE NAME" not in headers:
                     headers["LORE NAME"] = c
                 elif v == "EP" and "EP" not in headers:
                     headers["EP"] = c
@@ -77,20 +91,29 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
 
             sections.append({
                 "header_row": row_idx,
-                "username_col": col_idx,
+                "username_col": ucol,
                 "headers": headers,
             })
             logger.info(
-                "  Section: row %d, USERNAME at col %d, headers=%s",
-                row_idx + 1, col_idx, headers
+                "  Section: row %d, USERNAME col %d, headers=%s",
+                row_idx + 1, ucol, headers
             )
 
     return sections
 
 
-async def find_player(username: str) -> PlayerRow | None:
+async def find_player(username: str, lore_name: str | None = None) -> PlayerRow | None:
+    """
+    Search every detachment sheet for a player by username.
+    If lore_name is provided, use it to disambiguate duplicates:
+    prefer the row where both username AND lore name match.
+    """
     target = username.strip().lower()
-    logger.info("Searching for player '%s'...", username)
+    target_lore = lore_name.strip().lower() if lore_name else None
+    logger.info("Searching for player '%s' (lore: %s)...", username, lore_name or "any")
+
+    best_match: PlayerRow | None = None
+    exact_match: PlayerRow | None = None  # username + lore match
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
@@ -110,7 +133,7 @@ async def find_player(username: str) -> PlayerRow | None:
                 for row_idx in range(header_row + 1, len(all_values)):
                     row = all_values[row_idx]
 
-                    # Stop if we hit another header row at this column
+                    # Stop if this cell is a USERNAME header
                     if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
                         break
 
@@ -118,47 +141,63 @@ async def find_player(username: str) -> PlayerRow | None:
                         continue
 
                     cell_val = row[username_col].strip()
-                    if cell_val.lower() == target:
-                        # Read values from the SAME nearby columns
-                        def _safe(key: str, default: str = "") -> str:
-                            col = headers.get(key)
-                            if col is None or col >= len(row):
-                                return default
-                            return row[col].strip() or default
+                    if cell_val.lower() != target:
+                        continue
 
-                        def _safe_int(key: str) -> int:
-                            v = _safe(key, "0")
-                            try:
-                                return int(float(v))
-                            except (ValueError, TypeError):
-                                return 0
+                    # Found a username match — build the PlayerRow
+                    def _safe(key: str, default: str = "") -> str:
+                        col = headers.get(key)
+                        if col is None or col >= len(row):
+                            return default
+                        return row[col].strip() or default
 
-                        found_lore = _safe("LORE NAME")
-                        logger.info(
-                            "FOUND '%s' row %d, sheet '%s', lore='%s', "
-                            "username_col=%d, lore_col=%s",
-                            cell_val, row_idx + 1, sheet_name, found_lore,
-                            username_col, headers.get("LORE NAME")
-                        )
+                    def _safe_int(key: str) -> int:
+                        v = _safe(key, "0")
+                        try:
+                            return int(float(v))
+                        except (ValueError, TypeError):
+                            return 0
 
-                        return PlayerRow(
-                            sheet_name=sheet_name,
-                            row_index=row_idx + 1,
-                            username=cell_val,
-                            lore_name=found_lore,
-                            rank=_safe("RANK"),
-                            ep=_safe_int("EP"),
-                            tp=_safe_int("TP"),
-                            mp=_safe_int("MP"),
-                            col_ep=headers.get("EP", -1),
-                            col_tp=headers.get("TP", -1),
-                            col_mp=headers.get("MP", -1),
-                        )
+                    found_lore = _safe("LORE NAME")
+                    player = PlayerRow(
+                        sheet_name=sheet_name,
+                        row_index=row_idx + 1,
+                        username=cell_val,
+                        lore_name=found_lore,
+                        rank=_safe("RANK"),
+                        ep=_safe_int("EP"),
+                        tp=_safe_int("TP"),
+                        mp=_safe_int("MP"),
+                        col_ep=headers.get("EP", -1),
+                        col_tp=headers.get("TP", -1),
+                        col_mp=headers.get("MP", -1),
+                    )
+
+                    logger.info(
+                        "  Match: '%s' row %d, sheet '%s', lore='%s', "
+                        "EP_col=%s, TP_col=%s, MP_col=%s",
+                        cell_val, row_idx + 1, sheet_name, found_lore,
+                        headers.get("EP"), headers.get("TP"), headers.get("MP")
+                    )
+
+                    # Check lore name for exact match
+                    if target_lore and found_lore.lower() == target_lore:
+                        exact_match = player
+                        logger.info("  → Exact lore match!")
+                        return exact_match  # perfect match, return immediately
+
+                    # Keep first username match as fallback
+                    if best_match is None:
+                        best_match = player
 
         except gspread.exceptions.WorksheetNotFound:
             logger.warning("Worksheet '%s' not found.", sheet_name)
         except Exception:
             logger.exception("Error searching sheet '%s'.", sheet_name)
+
+    if best_match:
+        logger.info("Returning best match: '%s' in '%s'", best_match.username, best_match.sheet_name)
+        return best_match
 
     logger.warning("Player '%s' not found in any sheet.", username)
     return None
