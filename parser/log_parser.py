@@ -10,11 +10,16 @@ Format A — labelled:
     TP: 1
     MP: 0
 
-Format B — unlabelled:
+Format B — unlabelled with lore:
     Smaxhy
     Jessica Cruz
     EP: 2
     TP: 1
+
+Format C — unlabelled, username only (no lore):
+    smaxhy
+    rook
+    1tp
 
 The parser keeps:
     username
@@ -33,6 +38,8 @@ Detachment metadata such as:
     Valkyrie
     Rook Charlie
     Ancillary/Rook
+    delta
+    Training
 
 will NEVER be treated as a lore name or username.
 """
@@ -98,9 +105,8 @@ _RE_MP = re.compile(
 # Known metadata
 # ─────────────────────────────────────────────────────────────
 
-# Primary detachment / unit words. Any of these appearing in a
-# candidate username or lore string means the string is metadata,
-# not a person's name.
+# Primary detachment / unit words. Any of these appearing as a
+# token means the whole string is metadata, not a person's name.
 _PRIMARY_DETACHMENT_WORDS = {
     "rook",
     "bastion",
@@ -116,14 +122,15 @@ _PRIMARY_DETACHMENT_WORDS = {
     "quartermaster",
 }
 
-# Extra metadata words that can appear in a metadata string but are
-# not, on their own, sufficient reason to reject a string.
+# Extra metadata words. A single-word string whose only token is in
+# here is treated as metadata too (e.g. "delta", "charlie").
 _METADATA_WORDS = _PRIMARY_DETACHMENT_WORDS | {
     "division",
     "detachment",
     "unit",
     "corps",
     "squad",
+    "training",
     "device",
     "wielders",
     "information",
@@ -170,7 +177,8 @@ def _is_metadata(value: str | None) -> bool:
         Ancillary/Rook
         Rook Charlie
         [D] BASTION
-        ancillary/rook idk what to type
+        delta
+        Training
     """
     if not value:
         return False
@@ -188,8 +196,8 @@ def _is_metadata(value: str | None) -> bool:
     if any(tok in _PRIMARY_DETACHMENT_WORDS for tok in tokens):
         return True
 
-    # Strings made entirely of metadata words (e.g. "Alpha Bravo").
-    if len(tokens) > 1 and all(tok in _METADATA_WORDS for tok in tokens):
+    # Strings made entirely of metadata words (single or multi word).
+    if all(tok in _METADATA_WORDS for tok in tokens):
         return True
 
     return False
@@ -278,7 +286,7 @@ def _extract_unlabelled_lines(content: str) -> list[str]:
         if _SKIP_LINE.match(stripped):
             continue
 
-        # Skip stat-only lines: EP: 2 / TP 3 / 2 EP / 3TP
+        # Skip stat-only lines: EP: 2 / TP 3 / 2 EP / 3TP / 1tp
         if re.fullmatch(
             r"(?:[+-]?\d+\s*[A-Z]{2}|[A-Z]{2}\s*:?\s*[+-]?\d+)",
             stripped,
@@ -308,8 +316,9 @@ def parse_log(content: str) -> ParsedLog | None:
         - username
         - at least one of EP / TP / MP
 
-    Username is always the primary identifier.
-    Lore name is kept separate and never contains detachment metadata.
+    Username is the primary identifier.
+    Lore name is optional and only set when it clearly looks like a
+    real name (2+ words, not detachment metadata).
     """
 
     if not content or len(content.strip()) < 5:
@@ -342,8 +351,12 @@ def parse_log(content: str) -> ParsedLog | None:
         if m_lore:
             candidate_lore = _clean(m_lore.group(1))
 
-            # Never allow detachment metadata to become lore.
-            if candidate_lore and not _is_metadata(candidate_lore):
+            # Labelled lore: accept if not metadata and 2+ words.
+            if (
+                candidate_lore
+                and not _is_metadata(candidate_lore)
+                and len(candidate_lore.split()) >= 2
+            ):
                 lore_name = candidate_lore
     else:
         # ─────────────────────────────────────────────────────
@@ -355,13 +368,14 @@ def parse_log(content: str) -> ParsedLog | None:
         if plain_lines:
             username = plain_lines[0]
 
-            # Look at the remaining lines for a lore name.
+            # Only accept a 2+ word, non-metadata line as lore.
             for candidate in plain_lines[1:]:
                 if _is_metadata(candidate):
                     continue
-                if lore_name is None:
-                    lore_name = candidate
-                    break
+                if len(candidate.split()) < 2:
+                    continue
+                lore_name = candidate
+                break
 
     # ─────────────────────────────────────────────────────────
     # Username validation
