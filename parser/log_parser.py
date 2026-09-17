@@ -32,9 +32,9 @@ MAX_MP_PER_LOG = 5
 # ── Compiled patterns (case-insensitive) ─────────────────────────────
 _RE_USERNAME = re.compile(r"username\s*:\s*(.+)", re.IGNORECASE)
 _RE_LORE     = re.compile(r"lore\s*name\s*:\s*(.+)", re.IGNORECASE)
-_RE_EP       = re.compile(r"\bEP\s*:\s*([+-]?\d+)", re.IGNORECASE)
-_RE_TP       = re.compile(r"\bTP\s*:\s*([+-]?\d+)", re.IGNORECASE)
-_RE_MP       = re.compile(r"\bMP\s*:\s*([+-]?\d+)", re.IGNORECASE)
+_RE_EP       = re.compile(r"\bEP\s*:?\s*([+-]?\d+)", re.IGNORECASE)
+_RE_TP       = re.compile(r"\bTP\s*:?\s*([+-]?\d+)", re.IGNORECASE)
+_RE_MP       = re.compile(r"\bMP\s*:?\s*([+-]?\d+)", re.IGNORECASE)
 
 # Lines to skip when guessing username/lore from unlabelled format
 _SKIP_PATTERNS = re.compile(
@@ -96,7 +96,7 @@ def parse_log(content: str) -> ParsedLog | None:
             if _SKIP_PATTERNS.match(stripped):
                 continue
             # Skip lines that are just stats like "EP: 2"
-            if re.match(r"^[A-Z]{2}\s*:\s*[+-]?\d+$", stripped, re.IGNORECASE):
+            if re.match(r"^[A-Z]{2}\s*:?\s*[+-]?\d+$", stripped, re.IGNORECASE):
                 continue
             # Skip lines that look like labelled fields
             if re.match(r"^(username|lore\s*name)\s*:", stripped, re.IGNORECASE):
