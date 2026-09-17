@@ -105,9 +105,17 @@ async def run_scan(
             )
             continue
 
-        # ── Lore name validation ─────────────────────────────────
+        # ── Lore name validation (accepts partial/first-name matches) ──
         if parsed.lore_name and player.lore_name:
-            if parsed.lore_name.strip().lower() != player.lore_name.strip().lower():
+            log_lore = parsed.lore_name.strip().lower()
+            sheet_lore = player.lore_name.strip().lower()
+            # Accept: exact match, first name match, or sheet lore starts with log lore
+            lore_ok = (
+                log_lore == sheet_lore
+                or sheet_lore.startswith(log_lore + " ")
+                or sheet_lore.split()[0] == log_lore if sheet_lore else False
+            )
+            if not lore_ok:
                 result.lore_mismatches += 1
                 result.flagged_messages.append(
                     f"⚠️ Lore mismatch for **{parsed.username}** — "
