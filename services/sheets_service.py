@@ -1,9 +1,6 @@
 """
 Google Sheets service — finds players across multi-section sheets.
-Handles side-by-side squadrons by mapping headers directionally:
-  RANK is always LEFT of USERNAME
-  LORE NAME, EP, TP, MP are always RIGHT of USERNAME
-This prevents cross-section bleed.
+Only checks [D] ROOK, [D] BASTION, [C] ANCILLARY and their subdivisions.
 """
 
 from __future__ import annotations
@@ -40,10 +37,37 @@ def _get_credentials() -> Credentials:
 agcm = AsyncioGspreadClientManager(_get_credentials)
 
 
-async def _get_worksheet(sheet_name: str):
+async def _get_spreadsheet():
     client = await agcm.authorize()
-    ss = await client.open_by_key(config.GOOGLE_SPREADSHEET_ID)
-    return await ss.worksheet(sheet_name)
+    return await client.open_by_key(config.GOOGLE_SPREADSHEET_ID)
+
+
+async def _get_worksheet_safe(sheet_name: str):
+    """
+    Try to find the worksheet by exact name first.
+    If not found, list all worksheets and try case-insensitive / stripped match.
+    """
+    ss = await _get_spreadsheet()
+    
+    # Try exact match first
+    try:
+        return await ss.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+    
+    # List all worksheets and try fuzzy match
+    all_ws = await ss.worksheets()
+    available_names = [ws.title for ws in all_ws]
+    logger.info("Sheet '%s' not found. Available tabs: %s", sheet_name, available_names)
+    
+    target = sheet_name.strip().lower()
+    for ws in all_ws:
+        if ws.title.strip().lower() == target:
+            logger.info("Found fuzzy match: '%s' → '%s'", sheet_name, ws.title)
+            return ws
+    
+    logger.warning("No match for '%s' in any tab.", sheet_name)
+    return None
 
 
 def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
@@ -57,7 +81,6 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
     sections = []
 
     for row_idx, row in enumerate(all_values):
-        # Find all USERNAME columns in this row
         username_cols = [
             c for c, cell in enumerate(row)
             if cell.strip().upper() == "USERNAME"
@@ -79,7 +102,7 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
             for c in range(ucol + 1, min(len(row), ucol + 9)):
                 v = row[c].strip().upper()
                 if v == "USERNAME":
-                    break  # hit next section
+                    break
                 if v in ("LORE NAME", "LORENAME", "LORE") and "LORE NAME" not in headers:
                     headers["LORE NAME"] = c
                 elif v == "EP" and "EP" not in headers:
@@ -103,23 +126,21 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
 
 
 async def find_player(username: str, lore_name: str | None = None) -> PlayerRow | None:
-    """
-    Search every detachment sheet for a player by username.
-    If lore_name is provided, use it to disambiguate duplicates:
-    prefer the row where both username AND lore name match.
-    """
     target = username.strip().lower()
     target_lore = lore_name.strip().lower() if lore_name else None
-    logger.info("Searching for player '%s' (lore: %s)...", username, lore_name or "any")
+    logger.info("Searching for player '%s' (lore: %s) across sheets: %s",
+                username, lore_name or "any", config.DETACHMENT_SHEETS)
 
     best_match: PlayerRow | None = None
-    exact_match: PlayerRow | None = None  # username + lore match
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
-            ws = await _get_worksheet(sheet_name)
+            ws = await _get_worksheet_safe(sheet_name)
+            if ws is None:
+                continue
+                
             all_values = await ws.get_all_values()
-            logger.info("Sheet '%s': %d rows", sheet_name, len(all_values))
+            logger.info("Sheet '%s': %d rows", ws.title, len(all_values))
 
             sections = _find_table_sections(all_values)
             if not sections:
@@ -133,7 +154,6 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
                 for row_idx in range(header_row + 1, len(all_values)):
                     row = all_values[row_idx]
 
-                    # Stop if this cell is a USERNAME header
                     if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
                         break
 
@@ -144,7 +164,6 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
                     if cell_val.lower() != target:
                         continue
 
-                    # Found a username match — build the PlayerRow
                     def _safe(key: str, default: str = "") -> str:
                         col = headers.get(key)
                         if col is None or col >= len(row):
@@ -160,7 +179,7 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
 
                     found_lore = _safe("LORE NAME")
                     player = PlayerRow(
-                        sheet_name=sheet_name,
+                        sheet_name=ws.title,  # use actual sheet title
                         row_index=row_idx + 1,
                         username=cell_val,
                         lore_name=found_lore,
@@ -176,22 +195,17 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
                     logger.info(
                         "  Match: '%s' row %d, sheet '%s', lore='%s', "
                         "EP_col=%s, TP_col=%s, MP_col=%s",
-                        cell_val, row_idx + 1, sheet_name, found_lore,
+                        cell_val, row_idx + 1, ws.title, found_lore,
                         headers.get("EP"), headers.get("TP"), headers.get("MP")
                     )
 
-                    # Check lore name for exact match
                     if target_lore and found_lore.lower() == target_lore:
-                        exact_match = player
                         logger.info("  → Exact lore match!")
-                        return exact_match  # perfect match, return immediately
+                        return player
 
-                    # Keep first username match as fallback
                     if best_match is None:
                         best_match = player
 
-        except gspread.exceptions.WorksheetNotFound:
-            logger.warning("Worksheet '%s' not found.", sheet_name)
         except Exception:
             logger.exception("Error searching sheet '%s'.", sheet_name)
 
@@ -206,7 +220,10 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
 async def update_player_stats(
     player: PlayerRow, *, ep_delta: int, tp_delta: int, mp_delta: int
 ) -> None:
-    ws = await _get_worksheet(player.sheet_name)
+    ws = await _get_worksheet_safe(player.sheet_name)
+    if ws is None:
+        raise RuntimeError(f"Cannot find sheet '{player.sheet_name}' for update")
+    
     updates: list[gspread.Cell] = []
 
     if player.col_ep >= 0:
