@@ -6,30 +6,19 @@ Supported formats:
 Format A — labelled:
     Username: Smaxhy
     Lore name: Jessica Cruz
-    Detachment: Bastion
     EP: 2
     TP: 1
     MP: 0
-    Proof: [screenshot]
-
-Also supports:
-    Username: Smaxhy
-    Lore name: Jessica Cruz
-    Rank: Rook
-    EP: 2
-    TP: 1
 
 Format B — unlabelled:
     Smaxhy
     Jessica Cruz
-    Bastion
     EP: 2
     TP: 1
 
 The parser keeps:
     username
     lore_name
-    detachment
 
 separate.
 
@@ -42,8 +31,10 @@ Detachment metadata such as:
     Research
     Cannoneer
     Valkyrie
+    Rook Charlie
+    Ancillary/Rook
 
-will NEVER be treated as a lore name.
+will NEVER be treated as a lore name or username.
 """
 
 from __future__ import annotations
@@ -107,45 +98,104 @@ _RE_MP = re.compile(
 # Known metadata
 # ─────────────────────────────────────────────────────────────
 
-DETACHMENT_ALIASES = {
-    "rook": "ROOK",
-    "rook division": "ROOK",
-    "rook detachment": "ROOK",
-    "rook unit": "ROOK",
+# Primary detachment / unit words. Any of these appearing in a
+# candidate username or lore string means the string is metadata,
+# not a person's name.
+_PRIMARY_DETACHMENT_WORDS = {
+    "rook",
+    "bastion",
+    "ancillary",
+    "peacekeeper",
+    "peacekeepers",
+    "medical",
+    "research",
+    "cannoneer",
+    "cannoneers",
+    "valkyrie",
+    "command",
+    "quartermaster",
+}
 
-    "bastion": "BASTION",
-    "bastion division": "BASTION",
-    "bastion detachment": "BASTION",
-    "bastion unit": "BASTION",
-
-    "ancillary": "ANCILLARY",
-    "ancillary corps": "ANCILLARY",
-    "ancillary division": "ANCILLARY",
-    "ancillary detachment": "ANCILLARY",
-
-    "peacekeeper": "PEACEKEEPER",
-    "peacekeepers": "PEACEKEEPER",
-
-    "medical": "MEDICAL",
-    "medical unit": "MEDICAL",
-
-    "research": "RESEARCH",
-    "research unit": "RESEARCH",
-
-    "cannoneer": "CANNONEER",
-    "cannoneers": "CANNONEER",
-
-    "valkyrie": "VALKYRIE",
-
-    "command": "COMMAND",
-    "j command": "J. COMMAND",
-    "quartermaster": "QUARTERMASTER",
-    "device wielder": "DEVICE WIELDERS",
-    "device wielders": "DEVICE WIELDERS",
+# Extra metadata words that can appear in a metadata string but are
+# not, on their own, sufficient reason to reject a string.
+_METADATA_WORDS = _PRIMARY_DETACHMENT_WORDS | {
+    "division",
+    "detachment",
+    "unit",
+    "corps",
+    "squad",
+    "device",
+    "wielders",
+    "information",
+    "j",
+    "j.",
+    "alpha",
+    "bravo",
+    "charlie",
+    "delta",
+    "echo",
+    "foxtrot",
+    "golf",
+    "hotel",
+    "india",
+    "juliet",
+    "kilo",
+    "lima",
+    "mike",
+    "november",
+    "oscar",
+    "papa",
+    "quebec",
+    "romeo",
+    "sierra",
+    "tango",
+    "uniform",
+    "victor",
+    "whiskey",
+    "xray",
+    "yankee",
+    "zulu",
 }
 
 
-# Things that should never be interpreted as username/lore.
+def _is_metadata(value: str | None) -> bool:
+    """
+    Return True if *value* looks like detachment / unit metadata rather
+    than a real username or lore name.
+
+    Examples that return True:
+        Rook
+        Bastion
+        Ancillary
+        Ancillary/Rook
+        Rook Charlie
+        [D] BASTION
+        ancillary/rook idk what to type
+    """
+    if not value:
+        return False
+
+    t = value.strip().lower()
+
+    # Remove bracket prefixes like [d], [c], [u], [s].
+    t = re.sub(r"\[[a-z]\]\s*", "", t)
+
+    tokens = [p for p in re.split(r"[\s/,&|]+", t) if p]
+    if not tokens:
+        return False
+
+    # Any primary detachment word ⇒ definitely metadata.
+    if any(tok in _PRIMARY_DETACHMENT_WORDS for tok in tokens):
+        return True
+
+    # Strings made entirely of metadata words (e.g. "Alpha Bravo").
+    if len(tokens) > 1 and all(tok in _METADATA_WORDS for tok in tokens):
+        return True
+
+    return False
+
+
+# Things that should never be interpreted as username / lore.
 _SKIP_LINE = re.compile(
     r"^(?:"
     r"ep|tp|mp|proof|rank|screenshot|image|"
@@ -208,104 +258,6 @@ def _clamp(value: int, limit: int) -> int:
     return value
 
 
-def _normalise_detachment(value: str | None) -> str | None:
-    """
-    Convert common detachment names into a consistent value.
-
-    Examples:
-        Bastion -> BASTION
-        bastion -> BASTION
-        Rook Division -> ROOK
-        Ancillary/Rook -> None
-
-    Mixed values are deliberately left out because they do not
-    identify one specific sheet.
-    """
-
-    value = _clean(value)
-
-    if not value:
-        return None
-
-    normalised = _normalise(value)
-
-    # Direct match.
-    if normalised in DETACHMENT_ALIASES:
-        return DETACHMENT_ALIASES[normalised]
-
-    # Do not guess if multiple detachments are mentioned.
-    found = []
-
-    for alias, canonical in DETACHMENT_ALIASES.items():
-        if re.search(
-            rf"(?<![a-z]){re.escape(alias)}(?![a-z])",
-            normalised,
-        ):
-            if canonical not in found:
-                found.append(canonical)
-
-    if len(found) == 1:
-        return found[0]
-
-    return None
-
-
-def _looks_like_detachment(value: str | None) -> bool:
-    return _normalise_detachment(value) is not None
-
-
-def _looks_like_metadata(value: str | None) -> bool:
-    """
-    Detect strings such as:
-        Rook
-        Bastion
-        Ancillary
-        Ancillary/Rook
-        Rook Charlie
-    """
-
-    value = _clean(value)
-
-    if not value:
-        return False
-
-    normalised = _normalise(value)
-
-    # Direct detachment.
-    if normalised in DETACHMENT_ALIASES:
-        return True
-
-    # Check for known metadata words.
-    metadata_words = set(DETACHMENT_ALIASES.keys())
-
-    parts = re.split(r"[/|,;:\-]+", normalised)
-
-    for part in parts:
-        part = part.strip()
-
-        if part in metadata_words:
-            return True
-
-    # Examples:
-    # Rook Charlie
-    # Bastion Charlie
-    # Ancillary Charlie
-    for detachment in (
-        "rook",
-        "bastion",
-        "ancillary",
-        "peacekeeper",
-        "medical",
-        "research",
-        "cannoneer",
-        "valkyrie",
-    ):
-        if normalised.startswith(detachment + " "):
-            return True
-
-    return False
-
-
 def _extract_unlabelled_lines(content: str) -> list[str]:
     """
     Extract useful plain lines from an unlabelled log.
@@ -326,11 +278,7 @@ def _extract_unlabelled_lines(content: str) -> list[str]:
         if _SKIP_LINE.match(stripped):
             continue
 
-        # Skip stat-only lines:
-        # EP: 2
-        # TP 3
-        # 2 EP
-        # 3TP
+        # Skip stat-only lines: EP: 2 / TP 3 / 2 EP / 3TP
         if re.fullmatch(
             r"(?:[+-]?\d+\s*[A-Z]{2}|[A-Z]{2}\s*:?\s*[+-]?\d+)",
             stripped,
@@ -361,8 +309,7 @@ def parse_log(content: str) -> ParsedLog | None:
         - at least one of EP / TP / MP
 
     Username is always the primary identifier.
-
-    Lore name and detachment are kept separate.
+    Lore name is kept separate and never contains detachment metadata.
     """
 
     if not content or len(content.strip()) < 5:
@@ -385,12 +332,9 @@ def parse_log(content: str) -> ParsedLog | None:
 
     m_user = _RE_USERNAME.search(content)
     m_lore = _RE_LORE.search(content)
-    m_detachment = _RE_DETACHMENT.search(content)
-    m_rank = _RE_RANK.search(content)
 
     username: str | None = None
     lore_name: str | None = None
-    detachment: str | None = None
 
     if m_user:
         username = _clean(m_user.group(1))
@@ -398,18 +342,9 @@ def parse_log(content: str) -> ParsedLog | None:
         if m_lore:
             candidate_lore = _clean(m_lore.group(1))
 
-            # Never allow metadata to become lore.
-            if not _looks_like_metadata(candidate_lore):
+            # Never allow detachment metadata to become lore.
+            if candidate_lore and not _is_metadata(candidate_lore):
                 lore_name = candidate_lore
-
-        # Explicit detachment.
-        if m_detachment:
-            detachment = _normalise_detachment(m_detachment.group(1))
-
-        # Some logs may use Rank: Bastion / Rank: Rook etc.
-        if detachment is None and m_rank:
-            detachment = _normalise_detachment(m_rank.group(1))
-
     else:
         # ─────────────────────────────────────────────────────
         # Unlabelled format
@@ -420,34 +355,13 @@ def parse_log(content: str) -> ParsedLog | None:
         if plain_lines:
             username = plain_lines[0]
 
-            # The second line can be:
-            #   - lore name
-            #   - detachment
-            #   - metadata
-            #
-            # Determine which it is instead of blindly calling it lore.
-            remaining = plain_lines[1:]
-
-            for candidate in remaining:
-                if _looks_like_detachment(candidate):
-                    if detachment is None:
-                        detachment = _normalise_detachment(candidate)
+            # Look at the remaining lines for a lore name.
+            for candidate in plain_lines[1:]:
+                if _is_metadata(candidate):
                     continue
-
-                if _looks_like_metadata(candidate):
-                    continue
-
                 if lore_name is None:
                     lore_name = candidate
-
-            # If the second line was a mixed metadata string like:
-            # Ancillary/Rook
-            # don't treat it as lore.
-            if len(plain_lines) >= 2:
-                second = plain_lines[1]
-
-                if _looks_like_metadata(second):
-                    lore_name = None
+                    break
 
     # ─────────────────────────────────────────────────────────
     # Username validation
@@ -468,28 +382,17 @@ def parse_log(content: str) -> ParsedLog | None:
     if re.match(r"^(?:https?://|www\.)", username, re.IGNORECASE):
         return None
 
-    # Username itself should never be a known detachment.
-    if _looks_like_detachment(username):
+    # Username itself should never be detachment metadata.
+    if _is_metadata(username):
         return None
 
     # ─────────────────────────────────────────────────────────
     # Stats + caps
     # ─────────────────────────────────────────────────────────
 
-    ep = _clamp(
-        _extract_stat(m_ep),
-        MAX_EP_PER_LOG,
-    )
-
-    tp = _clamp(
-        _extract_stat(m_tp),
-        MAX_TP_PER_LOG,
-    )
-
-    mp = _clamp(
-        _extract_stat(m_mp),
-        MAX_MP_PER_LOG,
-    )
+    ep = _clamp(_extract_stat(m_ep), MAX_EP_PER_LOG)
+    tp = _clamp(_extract_stat(m_tp), MAX_TP_PER_LOG)
+    mp = _clamp(_extract_stat(m_mp), MAX_MP_PER_LOG)
 
     # ─────────────────────────────────────────────────────────
     # Return
@@ -498,7 +401,6 @@ def parse_log(content: str) -> ParsedLog | None:
     return ParsedLog(
         username=username,
         lore_name=lore_name,
-        detachment=detachment,
         ep=ep,
         tp=tp,
         mp=mp,
