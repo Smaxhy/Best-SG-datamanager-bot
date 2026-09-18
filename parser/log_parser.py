@@ -46,8 +46,18 @@ def _extract_stat(match) -> int:
     return int(match.group(1) or match.group(2))
 
 # Lines to skip when guessing username/lore from unlabelled format
-_SKIP_PATTERNS = re.compile(
+# _SKIP_START: skip if line STARTS with these (urls, stat labels, etc)
+_SKIP_START = re.compile(
     r"^(ep|tp|mp|proof|rank|screenshot|image|http|www\.|\[|\!)",
+    re.IGNORECASE,
+)
+# _SKIP_EXACT: skip if line IS exactly one of these keywords
+_SKIP_EXACT = re.compile(
+    r"^(bastion|rook|ancillary|ancilliary"
+    r"|charlie|delta|alpha|bravo"
+    r"|peacekeeper|medical|research|cannoneer|valkyrie"
+    r"|training|event|scouted|exam|promo"
+    r"|squadron|detachment|command)$",
     re.IGNORECASE,
 )
 
@@ -102,7 +112,9 @@ def parse_log(content: str) -> ParsedLog | None:
             stripped = line.strip()
             if not stripped:
                 continue
-            if _SKIP_PATTERNS.match(stripped):
+            if _SKIP_START.match(stripped):
+                continue
+            if _SKIP_EXACT.match(stripped):
                 continue
             # Skip lines that are just stats like "EP: 2" or "1 ep 1 tp"
             if re.match(r"^([+-]?\d+\s*[A-Z]{2}|[A-Z]{2}\s*:?\s*[+-]?\d+)$", stripped, re.IGNORECASE):
