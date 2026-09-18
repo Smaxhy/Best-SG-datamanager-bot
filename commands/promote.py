@@ -26,6 +26,9 @@ def _has_permission(interaction: discord.Interaction) -> bool:
     return config.DATA_MANAGER_ROLE_ID in role_ids or config.STAFF_ROLE_ID in role_ids
 
 
+PROMOTION_CHANNEL_ID = 1511781917693972601
+
+
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
     @tree.command(name="promote", description="Promote a player's rank or transfer them between detachments")
@@ -126,6 +129,17 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             await db.increment_dm_score(interaction.user.id, str(interaction.user), logs=1)
             await db.increment_dm_scans(interaction.user.id, str(interaction.user))
 
+            # Announce in promotions channel
+            try:
+                announce_ch = bot.get_channel(PROMOTION_CHANNEL_ID)
+                if announce_ch:
+                    await announce_ch.send(
+                        f"📋 **{player.username}** ({player.lore_name}) transferred to "
+                        f"**{detachment.name}** → **{subdivision.name}** as **{rank.value}**"
+                    )
+            except Exception:
+                pass
+
         else:
             # ── RANK PROMOTION: change rank in current sheet ─────
             player = await sheets.find_player(username)
@@ -156,3 +170,14 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             # Log promotion as weekly DM score
             await db.increment_dm_score(interaction.user.id, str(interaction.user), logs=1)
             await db.increment_dm_scans(interaction.user.id, str(interaction.user))
+
+            # Announce in promotions channel
+            try:
+                announce_ch = bot.get_channel(PROMOTION_CHANNEL_ID)
+                if announce_ch:
+                    await announce_ch.send(
+                        f"⬆️ **{player.username}** ({player.lore_name}) promoted "
+                        f"**{old_rank}** → **{rank.value}**"
+                    )
+            except Exception:
+                pass
