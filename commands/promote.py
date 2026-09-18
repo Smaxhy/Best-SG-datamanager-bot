@@ -1,9 +1,12 @@
 """
-/promote command — move a player from Ancillary to Rook or Bastion.
+/promote command — rank promotions and detachment transfers.
 
 Usage:
-    /promote username:Smaxhy detachment:Rook subdivision:Charlie
-    /promote username:Smaxhy detachment:Bastion subdivision:Alpha rank:PVT
+    /promote username:Smaxhy rank:PFC
+        → promotes Smaxhy to PFC in their current sheet, reorders by rank
+
+    /promote username:Smaxhy detachment:Rook subdivision:Charlie rank:RCT
+        → transfers from Ancillary to Rook Charlie as RCT
 """
 
 from __future__ import annotations
@@ -24,14 +27,20 @@ def _has_permission(interaction: discord.Interaction) -> bool:
 
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
-    @tree.command(name="promote", description="Move a player from Ancillary to Rook or Bastion")
+    @tree.command(name="promote", description="Promote a player's rank or transfer them between detachments")
     @app_commands.describe(
         username="The player's in-game username",
-        detachment="Destination detachment",
-        subdivision="Which squadron to place them in",
-        rank="Starting rank (default: RCT)",
+        rank="New rank",
+        detachment="(Transfer only) Destination detachment",
+        subdivision="(Transfer only) Which squadron",
     )
     @app_commands.choices(
+        rank=[
+            app_commands.Choice(name="RCT", value="RCT"),
+            app_commands.Choice(name="PVT", value="PVT"),
+            app_commands.Choice(name="PFC", value="PFC"),
+            app_commands.Choice(name="LCPL", value="LCPL"),
+        ],
         detachment=[
             app_commands.Choice(name="Rook", value="[D] ROOK"),
             app_commands.Choice(name="Bastion", value="[D] BASTION"),
@@ -42,19 +51,13 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             app_commands.Choice(name="Alpha (Bastion left)", value="Alpha"),
             app_commands.Choice(name="Bravo (Bastion right)", value="Bravo"),
         ],
-        rank=[
-            app_commands.Choice(name="RCT", value="RCT"),
-            app_commands.Choice(name="PVT", value="PVT"),
-            app_commands.Choice(name="PFC", value="PFC"),
-            app_commands.Choice(name="LCPL", value="LCPL"),
-        ],
     )
     async def promote_command(
         interaction: discord.Interaction,
         username: str,
-        detachment: app_commands.Choice[str],
-        subdivision: app_commands.Choice[str],
-        rank: app_commands.Choice[str] | None = None,
+        rank: app_commands.Choice[str],
+        detachment: app_commands.Choice[str] | None = None,
+        subdivision: app_commands.Choice[str] | None = None,
     ):
         if not _has_permission(interaction):
             await interaction.response.send_message(
@@ -63,45 +66,83 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             )
             return
 
-        # Validate subdivision matches detachment
-        valid_combos = {
-            "[D] ROOK": {"Charlie", "Delta"},
-            "[D] BASTION": {"Alpha", "Bravo"},
-        }
-        if subdivision.value not in valid_combos.get(detachment.value, set()):
+        # If transferring, both detachment and subdivision are required
+        if detachment and not subdivision:
             await interaction.response.send_message(
-                f"❌ **{subdivision.name}** doesn't belong to **{detachment.name}**. "
-                f"Valid options: {', '.join(valid_combos[detachment.value])}",
+                "❌ You need to pick a subdivision when transferring.",
+                ephemeral=True,
+            )
+            return
+        if subdivision and not detachment:
+            await interaction.response.send_message(
+                "❌ You need to pick a detachment when transferring.",
                 ephemeral=True,
             )
             return
 
+        # Validate subdivision matches detachment
+        if detachment and subdivision:
+            valid_combos = {
+                "[D] ROOK": {"Charlie", "Delta"},
+                "[D] BASTION": {"Alpha", "Bravo"},
+            }
+            if subdivision.value not in valid_combos.get(detachment.value, set()):
+                await interaction.response.send_message(
+                    f"❌ **{subdivision.name}** doesn't belong to **{detachment.name}**.",
+                    ephemeral=True,
+                )
+                return
+
         await interaction.response.defer()
 
-        # Find player in Ancillary
-        player = await sheets.find_player_in_ancillary(username)
-        if player is None:
-            await interaction.followup.send(
-                f"❌ Player **{username}** not found in Ancillary."
-            )
-            return
+        if detachment and subdivision:
+            # ── TRANSFER: move player to new detachment ──────────
+            player = await sheets.find_player(username)
+            if player is None:
+                await interaction.followup.send(f"❌ Player **{username}** not found.")
+                return
 
-        # Promote
-        try:
-            result = await sheets.promote_player(
-                player,
-                dest_sheet=detachment.value,
-                subdivision=subdivision.value,
-                new_rank=rank.value if rank else "RCT",
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Promotion failed: {exc}")
-            return
+            try:
+                result = await sheets.transfer_player(
+                    player,
+                    dest_sheet=detachment.value,
+                    subdivision=subdivision.value,
+                    new_rank=rank.value,
+                )
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Transfer failed: {exc}")
+                return
 
-        embed = discord.Embed(
-            title="✅ Player Promoted",
-            description=result,
-            colour=discord.Colour.green(),
-        )
-        embed.add_field(name="Promoted by", value=interaction.user.mention)
-        await interaction.followup.send(embed=embed)
+            embed = discord.Embed(
+                title="🔄 Player Transferred",
+                description=result,
+                colour=discord.Colour.blue(),
+            )
+            embed.add_field(name="By", value=interaction.user.mention)
+            await interaction.followup.send(embed=embed)
+
+        else:
+            # ── RANK PROMOTION: change rank in current sheet ─────
+            player = await sheets.find_player(username)
+            if player is None:
+                await interaction.followup.send(f"❌ Player **{username}** not found.")
+                return
+
+            old_rank = player.rank
+            try:
+                await sheets.promote_rank(player, rank.value)
+            except Exception as exc:
+                await interaction.followup.send(f"❌ Promotion failed: {exc}")
+                return
+
+            embed = discord.Embed(
+                title="⬆️ Player Promoted",
+                description=(
+                    f"**{player.username}** ({player.lore_name})\n"
+                    f"**{old_rank}** → **{rank.value}**\n"
+                    f"Sheet: **{player.sheet_name}**"
+                ),
+                colour=discord.Colour.green(),
+            )
+            embed.add_field(name="By", value=interaction.user.mention)
+            await interaction.followup.send(embed=embed)
