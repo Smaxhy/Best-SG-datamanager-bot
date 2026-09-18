@@ -242,8 +242,10 @@ async def update_player_stats(
 
 # ── Promotion helpers ────────────────────────────────────────────────
 
+# Rank order: index 0 = highest rank
+RANK_ORDER = {"LCPL": 0, "PFC": 1, "PVT": 2, "RCT": 3}
+
 # Maps subdivision names to their USERNAME column index in each sheet
-# Left squadron = col 6, Right squadron = col 15 (based on your layout)
 SUBDIVISION_MAP = {
     "[D] ROOK": {
         "Charlie": 6,
@@ -256,45 +258,146 @@ SUBDIVISION_MAP = {
 }
 
 
-async def find_player_in_ancillary(username: str) -> PlayerRow | None:
-    """Find a player specifically in the Ancillary sheet."""
-    ws = await _get_worksheet_safe("[C] ANCILLARY")
-    if ws is None:
-        return None
+def _rank_sort_key(rank_str: str) -> int:
+    """Return sort key for a rank. Unknown ranks go to the bottom."""
+    return RANK_ORDER.get(rank_str.strip().upper(), 99)
 
+
+async def _get_section_players(ws, section: dict, all_values: list[list[str]]) -> list[dict]:
+    """Read all players from a section as dicts with their row data."""
+    header_row = section["header_row"]
+    username_col = section["username_col"]
+    headers = section["headers"]
+    players = []
+
+    for row_idx in range(header_row + 1, len(all_values)):
+        row = all_values[row_idx]
+        if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+            break
+        if username_col >= len(row):
+            continue
+
+        cell_user = row[username_col].strip()
+        if not cell_user:
+            continue
+
+        # Read all fields for this player
+        data = {}
+        for key, col in headers.items():
+            if col < len(row):
+                data[key] = row[col].strip()
+            else:
+                data[key] = ""
+
+        players.append({
+            "row_idx": row_idx,
+            "data": data,
+        })
+
+    return players
+
+
+async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]) -> None:
+    """
+    Read all players in a section, sort by rank (LCPL first, RCT last),
+    then rewrite the rows in order.
+    """
+    header_row = section["header_row"]
+    username_col = section["username_col"]
+    headers = section["headers"]
+
+    players = await _get_section_players(ws, section, all_values)
+    if not players:
+        return
+
+    # Find the data row range (after header, before next header or end)
+    first_data_row = header_row + 1
+    last_data_row = first_data_row
+    for row_idx in range(header_row + 1, len(all_values)):
+        row = all_values[row_idx]
+        if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+            break
+        last_data_row = row_idx
+
+    # Sort players by rank
+    rank_col = headers.get("RANK")
+    if rank_col is not None:
+        players.sort(key=lambda p: _rank_sort_key(p["data"].get("RANK", "")))
+
+    # Build cell updates to rewrite all rows
+    updates = []
+    for i, player in enumerate(players):
+        row_num = first_data_row + i + 1  # 1-based
+        for key, col in headers.items():
+            value = player["data"].get(key, "")
+            updates.append(gspread.Cell(row=row_num, col=col + 1, value=value))
+
+    # Clear any leftover rows (if section had empty rows between players)
+    for row_idx in range(first_data_row + len(players), last_data_row + 1):
+        for key, col in headers.items():
+            updates.append(gspread.Cell(row=row_idx + 1, col=col + 1, value=""))
+
+    if updates:
+        await ws.update_cells(updates, value_input_option="RAW")
+
+    logger.info("Reordered section at row %d: %d players sorted by rank", header_row + 1, len(players))
+
+
+async def promote_rank(player: PlayerRow, new_rank: str) -> None:
+    """
+    Change a player's rank in their current sheet, then reorder
+    the section so higher ranks stay at the top.
+    """
+    ws = await _get_worksheet_safe(player.sheet_name)
+    if ws is None:
+        raise RuntimeError(f"Cannot find sheet '{player.sheet_name}'")
+
+    # First update the rank cell
     all_values = await ws.get_all_values()
     sections = _find_table_sections(all_values)
-    target = username.strip().lower()
 
+    # Find which section the player is in
+    target_section = None
     for section in sections:
+        ucol = section["username_col"]
         header_row = section["header_row"]
-        username_col = section["username_col"]
-        headers = section["headers"]
-
         for row_idx in range(header_row + 1, len(all_values)):
             row = all_values[row_idx]
-            if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+            if ucol < len(row) and row[ucol].strip().upper() == "USERNAME":
                 break
-            if username_col >= len(row):
-                continue
-            cell_val = row[username_col].strip()
-            if cell_val.lower() == target:
-                return _build_player(row, headers, "[C] ANCILLARY", row_idx)
+            if ucol < len(row) and row[ucol].strip().lower() == player.username.lower():
+                target_section = section
+                # Update rank in the data
+                rank_col = section["headers"].get("RANK")
+                if rank_col is not None:
+                    all_values[row_idx][rank_col] = new_rank
+                break
+        if target_section:
+            break
 
-    return None
+    if target_section is None:
+        raise RuntimeError(f"Player '{player.username}' not found in sheet '{player.sheet_name}'")
+
+    # Write the rank change
+    rank_col = target_section["headers"].get("RANK")
+    if rank_col is not None:
+        await ws.update_cell(player.row_index, rank_col + 1, new_rank)
+
+    # Re-read and reorder the section
+    all_values = await ws.get_all_values()
+    await _rewrite_section_sorted(ws, target_section, all_values)
+
+    logger.info("Promoted %s to %s in [%s], section reordered",
+                player.username, new_rank, player.sheet_name)
 
 
 async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[int, dict] | None:
-    """
-    Find the first empty row in a subdivision's section.
-    Returns (1-based row index, headers dict) or None.
-    """
+    """Find the first empty row in a subdivision's section."""
     subs = SUBDIVISION_MAP.get(sheet_name)
     if not subs or subdivision not in subs:
         return None
 
     target_col = subs[subdivision]
-
     ws = await _get_worksheet_safe(sheet_name)
     if ws is None:
         return None
@@ -302,43 +405,65 @@ async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[
     all_values = await ws.get_all_values()
     sections = _find_table_sections(all_values)
 
-    # Find the section with USERNAME at the target column
     for section in sections:
         if section["username_col"] != target_col:
             continue
-
         header_row = section["header_row"]
         headers = section["headers"]
-
         for row_idx in range(header_row + 1, len(all_values)):
             row = all_values[row_idx]
-            # Stop at next header
             if target_col < len(row) and row[target_col].strip().upper() == "USERNAME":
                 break
-            # Check if username cell is empty
             cell_val = row[target_col].strip() if target_col < len(row) else ""
             if not cell_val:
-                return (row_idx + 1, headers)  # 1-based
+                return (row_idx + 1, headers)
 
     return None
 
 
-async def promote_player(
+async def _clear_player_row(player: PlayerRow) -> None:
+    """Clear all fields for a player in their current sheet."""
+    ws = await _get_worksheet_safe(player.sheet_name)
+    if ws is None:
+        return
+
+    all_values = await ws.get_all_values()
+    sections = _find_table_sections(all_values)
+    clear_cells = []
+
+    for section in sections:
+        ucol = section["username_col"]
+        if ucol < len(all_values[player.row_index - 1]):
+            if all_values[player.row_index - 1][ucol].strip().lower() == player.username.lower():
+                for key, col in section["headers"].items():
+                    clear_cells.append(gspread.Cell(row=player.row_index, col=col + 1, value=""))
+                break
+
+    # Also clear EP/TP/MP if they're in separate columns not in headers
+    for col in [player.col_ep, player.col_tp, player.col_mp]:
+        if col >= 0:
+            already = any(c.row == player.row_index and c.col == col + 1 for c in clear_cells)
+            if not already:
+                clear_cells.append(gspread.Cell(row=player.row_index, col=col + 1, value=""))
+
+    if clear_cells:
+        await ws.update_cells(clear_cells, value_input_option="RAW")
+
+
+async def transfer_player(
     player: PlayerRow,
     dest_sheet: str,
     subdivision: str,
     new_rank: str = "RCT",
 ) -> str:
     """
-    Move a player from Ancillary to a destination sheet/subdivision.
-    Returns a success message or raises on error.
+    Move a player from their current sheet to a new detachment/subdivision.
+    Clears old row, writes to new sheet, reorders by rank.
     """
-    # Find empty row in destination
     result = await find_empty_row_in_section(dest_sheet, subdivision)
     if result is None:
         raise RuntimeError(
-            f"No empty row found in {dest_sheet} → {subdivision}. "
-            f"The section might be full."
+            f"No empty row found in {dest_sheet} → {subdivision}. Section might be full."
         )
 
     dest_row, dest_headers = result
@@ -349,61 +474,39 @@ async def promote_player(
         raise RuntimeError(f"Cannot find sheet '{dest_sheet}'")
 
     updates = []
-    ucol = dest_headers.get("USERNAME")
-    if ucol is not None:
-        updates.append(gspread.Cell(row=dest_row, col=ucol + 1, value=player.username))
-    lcol = dest_headers.get("LORE NAME")
-    if lcol is not None:
-        updates.append(gspread.Cell(row=dest_row, col=lcol + 1, value=player.lore_name))
-    rcol = dest_headers.get("RANK")
-    if rcol is not None:
-        updates.append(gspread.Cell(row=dest_row, col=rcol + 1, value=new_rank))
-    ecol = dest_headers.get("EP")
-    if ecol is not None:
-        updates.append(gspread.Cell(row=dest_row, col=ecol + 1, value="0"))
-    tcol = dest_headers.get("TP")
-    if tcol is not None:
-        updates.append(gspread.Cell(row=dest_row, col=tcol + 1, value="0"))
-    mcol = dest_headers.get("MP")
-    if mcol is not None:
-        updates.append(gspread.Cell(row=dest_row, col=mcol + 1, value="0"))
+    for key, value in [
+        ("USERNAME", player.username),
+        ("LORE NAME", player.lore_name),
+        ("RANK", new_rank),
+        ("EP", "0"),
+        ("TP", "0"),
+        ("MP", "0"),
+    ]:
+        col = dest_headers.get(key)
+        if col is not None:
+            updates.append(gspread.Cell(row=dest_row, col=col + 1, value=value))
 
     if updates:
         await ws_dest.update_cells(updates, value_input_option="RAW")
 
-    # Clear from Ancillary
-    ws_anc = await _get_worksheet_safe("[C] ANCILLARY")
-    if ws_anc is not None:
-        clear_cells = []
-        # Clear username, lore name, rank, EP, TP, MP
-        for col in [player.col_ep, player.col_tp, player.col_mp]:
-            if col >= 0:
-                clear_cells.append(gspread.Cell(row=player.row_index, col=col + 1, value=""))
+    # Clear from old sheet
+    await _clear_player_row(player)
 
-        # Also find and clear username and lore name columns
-        all_values = await ws_anc.get_all_values()
-        sections = _find_table_sections(all_values)
-        for section in sections:
-            if section["username_col"] < len(all_values[player.row_index - 1]):
-                if all_values[player.row_index - 1][section["username_col"]].strip().lower() == player.username.lower():
-                    ucol_anc = section["headers"].get("USERNAME")
-                    lcol_anc = section["headers"].get("LORE NAME")
-                    rcol_anc = section["headers"].get("RANK")
-                    if ucol_anc is not None:
-                        clear_cells.append(gspread.Cell(row=player.row_index, col=ucol_anc + 1, value=""))
-                    if lcol_anc is not None:
-                        clear_cells.append(gspread.Cell(row=player.row_index, col=lcol_anc + 1, value=""))
-                    if rcol_anc is not None:
-                        clear_cells.append(gspread.Cell(row=player.row_index, col=rcol_anc + 1, value=""))
-                    break
+    # Reorder destination section by rank
+    all_values = await ws_dest.get_all_values()
+    sections = _find_table_sections(all_values)
+    target_col = SUBDIVISION_MAP.get(dest_sheet, {}).get(subdivision)
+    for section in sections:
+        if section["username_col"] == target_col:
+            await _rewrite_section_sorted(ws_dest, section, all_values)
+            break
 
-        if clear_cells:
-            await ws_anc.update_cells(clear_cells, value_input_option="RAW")
-
-    logger.info("Promoted %s from Ancillary to %s → %s row %d",
-                player.username, dest_sheet, subdivision, dest_row)
+    logger.info("Transferred %s from %s to %s → %s row %d",
+                player.username, player.sheet_name, dest_sheet, subdivision, dest_row)
 
     return (
-        f"**{player.username}** ({player.lore_name}) promoted to "
-        f"**{dest_sheet}** → **{subdivision}** as **{new_rank}** (row {dest_row})"
+        f"**{player.username}** ({player.lore_name})\n"
+        f"From: **{player.sheet_name}**\n"
+        f"To: **{dest_sheet}** → **{subdivision}** as **{new_rank}**\n"
+        f"EP/TP/MP reset to 0"
     )
