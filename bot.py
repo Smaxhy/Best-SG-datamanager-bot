@@ -16,7 +16,7 @@ from discord import app_commands
 
 import config
 from services.database_service import init_db
-from commands import scan, stats
+from commands import scan, stats, leaderboard
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -52,6 +52,7 @@ class DataManagerBot(discord.Client):
         # Register commands
         scan.register(self.tree, self)
         stats.register(self.tree, self)
+        leaderboard.register(self.tree, self)
 
         # Sync slash commands globally (or to a specific guild for testing)
         guild_id = os.getenv("DEV_GUILD_ID")
