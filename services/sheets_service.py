@@ -1,6 +1,6 @@
 """
 Google Sheets service — finds players across multi-section sheets.
-Only checks [D] BASTION, [D] ROOK, and [C] ANCILLARY.
+Only checks [D] ROOK, [D] BASTION, [C] ANCILLARY and their subdivisions.
 Searches by username, lore name, or first name.
 """
 
@@ -22,13 +22,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-
-# ── Hard whitelist: only these three sheets are ever scanned ──
-ALLOWED_SHEETS: tuple[str, ...] = (
-    " [D] BASTION",
-    "[D] ROOK",
-    "[C] ANCILLARY",
-)
 
 
 def _get_credentials() -> Credentials:
@@ -62,7 +55,7 @@ async def _get_worksheet_safe(sheet_name: str):
     target = sheet_name.strip().lower()
     for ws in all_ws:
         if ws.title.strip().lower() == target:
-            logger.info("Found normalized match: '%s' -> '%s'", sheet_name, ws.title)
+            logger.info("Found fuzzy match: '%s' -> '%s'", sheet_name, ws.title)
             return ws
     logger.warning("No match for '%s' in any tab.", sheet_name)
     return None
@@ -135,24 +128,22 @@ def _build_player(row, headers, ws_title, row_idx) -> PlayerRow:
 
 async def find_player(username: str, lore_name: str | None = None) -> PlayerRow | None:
     """
-    Search only BASTION, ROOK, and ANCILLARY.
-    Priority:
-      1. exact username + exact lore
-      2. exact username
-      3. full lore typed as username
-      4. first name of lore typed as username
+    Search priority:
+    1. Exact username match (+ lore match if both given)
+    2. Lore name typed as username (exact full lore match)
+    3. First name match in lore column
+    Log can have just username, no lore needed.
     """
     target = username.strip().lower()
     target_lore = lore_name.strip().lower() if lore_name else None
     logger.info("Searching for player '%s' (lore: %s)...", username, lore_name or "any")
 
-    exact_user_lore: PlayerRow | None = None
-    exact_user: PlayerRow | None = None
-    exact_lore_as_user: PlayerRow | None = None
-    first_name: PlayerRow | None = None
+    exact_user_lore: PlayerRow | None = None   # username + lore both match
+    exact_user: PlayerRow | None = None         # username matches
+    exact_lore_as_user: PlayerRow | None = None # full lore name matches target
+    first_name: PlayerRow | None = None         # first name of lore matches target
 
-    # Only iterate the hard whitelist — ignore config.DETACHMENT_SHEETS entirely.
-    for sheet_name in ALLOWED_SHEETS:
+    for sheet_name in config.DETACHMENT_SHEETS:
         try:
             ws = await _get_worksheet_safe(sheet_name)
             if ws is None:
@@ -191,52 +182,39 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
                     # 1. Exact username match
                     if cell_user_low == target:
                         p = _build_player(row, headers, ws.title, row_idx)
+                        # If lore also matches, best possible result
                         if target_lore and cell_lore_low == target_lore:
-                            logger.info(
-                                "  EXACT user+lore: '%s' / '%s' row %d sheet='%s'",
-                                cell_user, cell_lore, row_idx + 1, ws.title,
-                            )
+                            logger.info("  EXACT user+lore: '%s' / '%s' row %d", cell_user, cell_lore, row_idx+1)
                             return p
                         if exact_user is None:
                             exact_user = p
-                            logger.info(
-                                "  EXACT USERNAME match: '%s' -> lore='%s', sheet='%s', row=%d",
-                                cell_user, cell_lore, ws.title, row_idx + 1,
-                            )
+                            logger.info("  Username match: '%s' row %d, lore='%s'", cell_user, row_idx+1, cell_lore)
 
-                    # 2. Full lore name typed as username
+                    # 2. Full lore name matches what was typed as "username"
                     elif cell_lore_low and cell_lore_low == target:
                         if exact_lore_as_user is None:
                             exact_lore_as_user = _build_player(row, headers, ws.title, row_idx)
-                            logger.info(
-                                "  Lore-as-username: '%s' -> user '%s' row %d",
-                                target, cell_user, row_idx + 1,
-                            )
+                            logger.info("  Lore-as-username: '%s' -> user '%s' row %d", target, cell_user, row_idx+1)
 
-                    # 3. First name of lore typed as username
+                    # 3. First name of lore matches
                     elif cell_lore_low:
                         lore_parts = cell_lore_low.split()
                         if lore_parts and lore_parts[0] == target:
                             if first_name is None:
                                 first_name = _build_player(row, headers, ws.title, row_idx)
-                                logger.info(
-                                    "  First-name: '%s' -> '%s' (%s) row %d",
-                                    target, cell_user, cell_lore, row_idx + 1,
-                                )
+                                logger.info("  First-name: '%s' -> '%s' (%s) row %d", target, cell_user, cell_lore, row_idx+1)
 
         except Exception:
             logger.exception("Error searching sheet '%s'.", sheet_name)
 
+    # Return best match
     for match, label in [
         (exact_user, "username"),
         (exact_lore_as_user, "lore-as-username"),
         (first_name, "first-name"),
     ]:
         if match:
-            logger.info(
-                "Returning %s match: '%s' in '%s'",
-                label, match.username, match.sheet_name,
-            )
+            logger.info("Returning %s match: '%s' in '%s'", label, match.username, match.sheet_name)
             return match
 
     logger.warning("Player '%s' not found.", username)
@@ -251,24 +229,181 @@ async def update_player_stats(
         raise RuntimeError(f"Cannot find sheet '{player.sheet_name}' for update")
     updates: list[gspread.Cell] = []
     if player.col_ep >= 0:
-        updates.append(gspread.Cell(
-            row=player.row_index, col=player.col_ep + 1,
-            value=str(player.ep + ep_delta),
-        ))
+        updates.append(gspread.Cell(row=player.row_index, col=player.col_ep + 1, value=str(player.ep + ep_delta)))
     if player.col_tp >= 0:
-        updates.append(gspread.Cell(
-            row=player.row_index, col=player.col_tp + 1,
-            value=str(player.tp + tp_delta),
-        ))
+        updates.append(gspread.Cell(row=player.row_index, col=player.col_tp + 1, value=str(player.tp + tp_delta)))
     if player.col_mp >= 0:
-        updates.append(gspread.Cell(
-            row=player.row_index, col=player.col_mp + 1,
-            value=str(player.mp + mp_delta),
-        ))
+        updates.append(gspread.Cell(row=player.row_index, col=player.col_mp + 1, value=str(player.mp + mp_delta)))
     if updates:
         await ws.update_cells(updates, value_input_option="RAW")
-        logger.info(
-            "Updated %s in [%s] row %d: EP %+d, TP %+d, MP %+d",
-            player.username, player.sheet_name, player.row_index,
-            ep_delta, tp_delta, mp_delta,
+        logger.info("Updated %s in [%s] row %d: EP %+d, TP %+d, MP %+d",
+                    player.username, player.sheet_name, player.row_index, ep_delta, tp_delta, mp_delta)
+
+
+# ── Promotion helpers ────────────────────────────────────────────────
+
+# Maps subdivision names to their USERNAME column index in each sheet
+# Left squadron = col 6, Right squadron = col 15 (based on your layout)
+SUBDIVISION_MAP = {
+    "[D] ROOK": {
+        "Charlie": 6,
+        "Delta": 15,
+    },
+    "[D] BASTION": {
+        "Alpha": 6,
+        "Bravo": 15,
+    },
+}
+
+
+async def find_player_in_ancillary(username: str) -> PlayerRow | None:
+    """Find a player specifically in the Ancillary sheet."""
+    ws = await _get_worksheet_safe("[C] ANCILLARY")
+    if ws is None:
+        return None
+
+    all_values = await ws.get_all_values()
+    sections = _find_table_sections(all_values)
+    target = username.strip().lower()
+
+    for section in sections:
+        header_row = section["header_row"]
+        username_col = section["username_col"]
+        headers = section["headers"]
+
+        for row_idx in range(header_row + 1, len(all_values)):
+            row = all_values[row_idx]
+            if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                break
+            if username_col >= len(row):
+                continue
+            cell_val = row[username_col].strip()
+            if cell_val.lower() == target:
+                return _build_player(row, headers, "[C] ANCILLARY", row_idx)
+
+    return None
+
+
+async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[int, dict] | None:
+    """
+    Find the first empty row in a subdivision's section.
+    Returns (1-based row index, headers dict) or None.
+    """
+    subs = SUBDIVISION_MAP.get(sheet_name)
+    if not subs or subdivision not in subs:
+        return None
+
+    target_col = subs[subdivision]
+
+    ws = await _get_worksheet_safe(sheet_name)
+    if ws is None:
+        return None
+
+    all_values = await ws.get_all_values()
+    sections = _find_table_sections(all_values)
+
+    # Find the section with USERNAME at the target column
+    for section in sections:
+        if section["username_col"] != target_col:
+            continue
+
+        header_row = section["header_row"]
+        headers = section["headers"]
+
+        for row_idx in range(header_row + 1, len(all_values)):
+            row = all_values[row_idx]
+            # Stop at next header
+            if target_col < len(row) and row[target_col].strip().upper() == "USERNAME":
+                break
+            # Check if username cell is empty
+            cell_val = row[target_col].strip() if target_col < len(row) else ""
+            if not cell_val:
+                return (row_idx + 1, headers)  # 1-based
+
+    return None
+
+
+async def promote_player(
+    player: PlayerRow,
+    dest_sheet: str,
+    subdivision: str,
+    new_rank: str = "RCT",
+) -> str:
+    """
+    Move a player from Ancillary to a destination sheet/subdivision.
+    Returns a success message or raises on error.
+    """
+    # Find empty row in destination
+    result = await find_empty_row_in_section(dest_sheet, subdivision)
+    if result is None:
+        raise RuntimeError(
+            f"No empty row found in {dest_sheet} → {subdivision}. "
+            f"The section might be full."
         )
+
+    dest_row, dest_headers = result
+
+    # Write to destination
+    ws_dest = await _get_worksheet_safe(dest_sheet)
+    if ws_dest is None:
+        raise RuntimeError(f"Cannot find sheet '{dest_sheet}'")
+
+    updates = []
+    ucol = dest_headers.get("USERNAME")
+    if ucol is not None:
+        updates.append(gspread.Cell(row=dest_row, col=ucol + 1, value=player.username))
+    lcol = dest_headers.get("LORE NAME")
+    if lcol is not None:
+        updates.append(gspread.Cell(row=dest_row, col=lcol + 1, value=player.lore_name))
+    rcol = dest_headers.get("RANK")
+    if rcol is not None:
+        updates.append(gspread.Cell(row=dest_row, col=rcol + 1, value=new_rank))
+    ecol = dest_headers.get("EP")
+    if ecol is not None:
+        updates.append(gspread.Cell(row=dest_row, col=ecol + 1, value="0"))
+    tcol = dest_headers.get("TP")
+    if tcol is not None:
+        updates.append(gspread.Cell(row=dest_row, col=tcol + 1, value="0"))
+    mcol = dest_headers.get("MP")
+    if mcol is not None:
+        updates.append(gspread.Cell(row=dest_row, col=mcol + 1, value="0"))
+
+    if updates:
+        await ws_dest.update_cells(updates, value_input_option="RAW")
+
+    # Clear from Ancillary
+    ws_anc = await _get_worksheet_safe("[C] ANCILLARY")
+    if ws_anc is not None:
+        clear_cells = []
+        # Clear username, lore name, rank, EP, TP, MP
+        for col in [player.col_ep, player.col_tp, player.col_mp]:
+            if col >= 0:
+                clear_cells.append(gspread.Cell(row=player.row_index, col=col + 1, value=""))
+
+        # Also find and clear username and lore name columns
+        all_values = await ws_anc.get_all_values()
+        sections = _find_table_sections(all_values)
+        for section in sections:
+            if section["username_col"] < len(all_values[player.row_index - 1]):
+                if all_values[player.row_index - 1][section["username_col"]].strip().lower() == player.username.lower():
+                    ucol_anc = section["headers"].get("USERNAME")
+                    lcol_anc = section["headers"].get("LORE NAME")
+                    rcol_anc = section["headers"].get("RANK")
+                    if ucol_anc is not None:
+                        clear_cells.append(gspread.Cell(row=player.row_index, col=ucol_anc + 1, value=""))
+                    if lcol_anc is not None:
+                        clear_cells.append(gspread.Cell(row=player.row_index, col=lcol_anc + 1, value=""))
+                    if rcol_anc is not None:
+                        clear_cells.append(gspread.Cell(row=player.row_index, col=rcol_anc + 1, value=""))
+                    break
+
+        if clear_cells:
+            await ws_anc.update_cells(clear_cells, value_input_option="RAW")
+
+    logger.info("Promoted %s from Ancillary to %s → %s row %d",
+                player.username, dest_sheet, subdivision, dest_row)
+
+    return (
+        f"**{player.username}** ({player.lore_name}) promoted to "
+        f"**{dest_sheet}** → **{subdivision}** as **{new_rank}** (row {dest_row})"
+    )
