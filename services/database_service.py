@@ -17,7 +17,14 @@ from models import Base, ProcessedLog, DataManagerStats, ScanHistory
 
 logger = logging.getLogger("bot.database")
 
-engine = create_async_engine(config.DATABASE_URL, echo=False)
+engine = create_async_engine(
+    config.DATABASE_URL,
+    echo=False,
+    pool_recycle=300,      # recycle connections every 5 min
+    pool_pre_ping=True,    # test connection before using it
+    pool_size=5,
+    max_overflow=5,
+)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
