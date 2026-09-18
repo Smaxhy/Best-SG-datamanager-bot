@@ -18,6 +18,13 @@ from services import sheets_service as sheets
 
 logger = logging.getLogger("bot.scan")
 
+# ── Blacklisted players (case-insensitive) ───────────────────────
+BLACKLISTED_USERNAMES = {"tripleaabatterynocap"}
+BLACKLISTED_LORE_NAMES = {"elias e."}
+
+# ── Max stats per log entry ──────────────────────────────────────
+MAX_STAT_PER_LOG = 5
+
 
 def _extract_text(message: discord.Message) -> str:
     """
@@ -80,6 +87,28 @@ async def run_scan(
         if parsed is None:
             continue
 
+        # ── Blacklist check ──────────────────────────────────────
+        if parsed.username.strip().lower() in BLACKLISTED_USERNAMES:
+            continue
+        if parsed.lore_name and parsed.lore_name.strip().lower() in BLACKLISTED_LORE_NAMES:
+            continue
+
+        # ── Stat limit check ─────────────────────────────────────
+        over_limit = []
+        if abs(parsed.ep) > MAX_STAT_PER_LOG:
+            over_limit.append(f"EP: {parsed.ep}")
+        if abs(parsed.tp) > MAX_STAT_PER_LOG:
+            over_limit.append(f"TP: {parsed.tp}")
+        if abs(parsed.mp) > MAX_STAT_PER_LOG:
+            over_limit.append(f"MP: {parsed.mp}")
+        if over_limit:
+            result.invalid_logs += 1
+            result.flagged_messages.append(
+                f"🚫 **{parsed.username}** — Rejected: {', '.join(over_limit)} exceeds "
+                f"the max of {MAX_STAT_PER_LOG} per log. Please alert an NCO."
+            )
+            continue
+
         result.valid_logs += 1
 
         # ── Duplicate check ──────────────────────────────────────
@@ -113,7 +142,7 @@ async def run_scan(
             lore_ok = (
                 log_lore == sheet_lore
                 or sheet_lore.startswith(log_lore + " ")
-                or (sheet_lore.split()[0] == log_lore if sheet_lore else False)
+                or sheet_lore.split()[0] == log_lore if sheet_lore else False
             )
             if not lore_ok:
                 result.lore_mismatches += 1
@@ -158,7 +187,7 @@ async def run_scan(
                 ep=parsed.ep,
                 tp=parsed.tp,
                 mp=parsed.mp,
-                detachment=player.sheet_name or "",
+                detachment=player.sheet_name,
             )
         except Exception:
             logger.warning("Message %s already recorded — skipping.", message.id)
