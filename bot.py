@@ -54,18 +54,16 @@ class DataManagerBot(discord.Client):
         stats.register(self.tree, self)
         leaderboard.register(self.tree, self)
 
-        # Sync slash commands globally (or to a specific guild for testing)
-        guild_id = os.getenv("DEV_GUILD_ID")
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            logger.info("Slash commands synced to dev guild %s.", guild_id)
-        else:
-            await self.tree.sync()
-            logger.info("Slash commands synced globally.")
+        # Sync globally only
+        await self.tree.sync()
+        logger.info("Slash commands synced globally.")
 
     async def on_ready(self) -> None:
+        # Clear leftover guild-specific commands (fixes duplicates)
+        for guild in self.guilds:
+            self.tree.clear_commands(guild=guild)
+            await self.tree.sync(guild=guild)
+            logger.info("Cleared guild commands for %s", guild.name)
         logger.info("Bot is online as %s (ID: %s)", self.user, self.user.id)
 
 
