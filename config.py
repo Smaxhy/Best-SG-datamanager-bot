@@ -12,6 +12,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DATA_MANAGER_ROLE_ID = int(os.getenv("DATA_MANAGER_ROLE_ID", "0"))
 STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "0"))
+NCO_ROLE_ID = int(os.getenv("NCO_ROLE_ID", "0"))
 
 # Optional: restrict which channels can be scanned (comma-separated IDs)
 # Leave empty to allow any channel the bot can read.
