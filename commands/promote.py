@@ -16,6 +16,7 @@ from discord import app_commands
 
 import config
 from services import sheets_service as sheets
+from services import database_service as db
 
 
 def _has_permission(interaction: discord.Interaction) -> bool:
@@ -121,6 +122,10 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             embed.add_field(name="By", value=interaction.user.mention)
             await interaction.followup.send(embed=embed)
 
+            # Log transfer as weekly DM score
+            await db.increment_dm_score(interaction.user.id, str(interaction.user), logs=1)
+            await db.increment_dm_scans(interaction.user.id, str(interaction.user))
+
         else:
             # ── RANK PROMOTION: change rank in current sheet ─────
             player = await sheets.find_player(username)
@@ -147,3 +152,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             embed.set_footer(text=f"Sheet: {player.sheet_name}")
             embed.add_field(name="By", value=interaction.user.mention)
             await interaction.followup.send(embed=embed)
+
+            # Log promotion as weekly DM score
+            await db.increment_dm_score(interaction.user.id, str(interaction.user), logs=1)
+            await db.increment_dm_scans(interaction.user.id, str(interaction.user))
