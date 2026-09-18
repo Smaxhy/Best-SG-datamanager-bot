@@ -343,21 +343,95 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     logger.info("Reordered section at row %d: %d players sorted by rank", header_row + 1, len(players))
 
 
-async def promote_rank(player: PlayerRow, new_rank: str) -> None:
+# Promotion requirements: what you need to go FROM current rank TO next rank
+# RCT → PVT: 4 EP + 1 TP + Scouted + Exam (scouted/exam checked manually)
+# PVT → PFC: 9 EP + 4 TP
+# PFC → LCPL: 10 EP + 6 TP + 2 MP
+RANK_REQUIREMENTS = {
+    "PVT":  {"from": "RCT",  "ep": 4,  "tp": 1, "mp": 0, "extra": "Scouted + Exam (verify manually)"},
+    "PFC":  {"from": "PVT",  "ep": 9,  "tp": 4, "mp": 0, "extra": None},
+    "LCPL": {"from": "PFC",  "ep": 10, "tp": 6, "mp": 2, "extra": None},
+}
+
+
+def check_promotion_requirements(player: PlayerRow, new_rank: str) -> tuple[bool, str]:
     """
-    Change a player's rank in their current sheet, then reorder
-    the section so higher ranks stay at the top.
+    Check if a player meets the requirements for promotion.
+    Returns (eligible: bool, message: str).
+    If eligible, message shows what points will remain after deduction.
     """
+    new_rank_upper = new_rank.strip().upper()
+    req = RANK_REQUIREMENTS.get(new_rank_upper)
+
+    if req is None:
+        return True, "No requirements defined for this rank."
+
+    # Check if promoting from the correct rank
+    current = player.rank.strip().upper()
+    if current != req["from"]:
+        # Allow skipping ranks (e.g. RCT → PFC) by checking all intermediate reqs
+        # But for now, just warn
+        pass
+
+    # Check points
+    missing = []
+    if player.ep < req["ep"]:
+        missing.append(f"EP: has {player.ep}, needs {req['ep']}")
+    if player.tp < req["tp"]:
+        missing.append(f"TP: has {player.tp}, needs {req['tp']}")
+    if req["mp"] > 0 and player.mp < req["mp"]:
+        missing.append(f"MP: has {player.mp}, needs {req['mp']}")
+
+    if missing:
+        msg = (
+            f"❌ **{player.username}** does not meet requirements for **{new_rank_upper}**:\n"
+            + "\n".join(f"  • {m}" for m in missing)
+        )
+        if req["extra"]:
+            msg += f"\n  • Also requires: {req['extra']}"
+        return False, msg
+
+    # Eligible — calculate remaining points
+    remaining_ep = player.ep - req["ep"]
+    remaining_tp = player.tp - req["tp"]
+    remaining_mp = player.mp - req["mp"]
+
+    msg = (
+        f"✅ Requirements met for **{new_rank_upper}**\n"
+        f"EP: {player.ep} - {req['ep']} = **{remaining_ep}** remaining\n"
+        f"TP: {player.tp} - {req['tp']} = **{remaining_tp}** remaining"
+    )
+    if req["mp"] > 0:
+        msg += f"\nMP: {player.mp} - {req['mp']} = **{remaining_mp}** remaining"
+    if req["extra"]:
+        msg += f"\n⚠️ Also requires: {req['extra']}"
+
+    return True, msg
+
+
+async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) -> str:
+    """
+    Change a player's rank in their current sheet.
+    Checks requirements, deducts points, then reorders the section.
+    Returns a summary message.
+    """
+    new_rank_upper = new_rank.strip().upper()
+
+    # Check requirements
+    eligible, req_msg = check_promotion_requirements(player, new_rank_upper)
+    if not eligible and not force:
+        raise ValueError(req_msg)
+
     ws = await _get_worksheet_safe(player.sheet_name)
     if ws is None:
         raise RuntimeError(f"Cannot find sheet '{player.sheet_name}'")
 
-    # First update the rank cell
     all_values = await ws.get_all_values()
     sections = _find_table_sections(all_values)
 
     # Find which section the player is in
     target_section = None
+    player_row_idx = None
     for section in sections:
         ucol = section["username_col"]
         header_row = section["header_row"]
@@ -367,10 +441,7 @@ async def promote_rank(player: PlayerRow, new_rank: str) -> None:
                 break
             if ucol < len(row) and row[ucol].strip().lower() == player.username.lower():
                 target_section = section
-                # Update rank in the data
-                rank_col = section["headers"].get("RANK")
-                if rank_col is not None:
-                    all_values[row_idx][rank_col] = new_rank
+                player_row_idx = row_idx
                 break
         if target_section:
             break
@@ -378,17 +449,55 @@ async def promote_rank(player: PlayerRow, new_rank: str) -> None:
     if target_section is None:
         raise RuntimeError(f"Player '{player.username}' not found in sheet '{player.sheet_name}'")
 
-    # Write the rank change
-    rank_col = target_section["headers"].get("RANK")
+    headers = target_section["headers"]
+
+    # Calculate new point values after deduction
+    req = RANK_REQUIREMENTS.get(new_rank_upper)
+    if req and not force:
+        new_ep = player.ep - req["ep"]
+        new_tp = player.tp - req["tp"]
+        new_mp = player.mp - req["mp"]
+    else:
+        new_ep = player.ep
+        new_tp = player.tp
+        new_mp = player.mp
+
+    # Write rank + deducted points
+    updates = []
+    rank_col = headers.get("RANK")
     if rank_col is not None:
-        await ws.update_cell(player.row_index, rank_col + 1, new_rank)
+        updates.append(gspread.Cell(row=player.row_index, col=rank_col + 1, value=new_rank_upper))
+    ep_col = headers.get("EP")
+    if ep_col is not None:
+        updates.append(gspread.Cell(row=player.row_index, col=ep_col + 1, value=str(new_ep)))
+    tp_col = headers.get("TP")
+    if tp_col is not None:
+        updates.append(gspread.Cell(row=player.row_index, col=tp_col + 1, value=str(new_tp)))
+    mp_col = headers.get("MP")
+    if mp_col is not None and req and req["mp"] > 0:
+        updates.append(gspread.Cell(row=player.row_index, col=mp_col + 1, value=str(new_mp)))
+
+    if updates:
+        await ws.update_cells(updates, value_input_option="RAW")
+
+    # Also update the in-memory data for reordering
+    if player_row_idx is not None:
+        if rank_col is not None:
+            all_values[player_row_idx][rank_col] = new_rank_upper
+        if ep_col is not None:
+            all_values[player_row_idx][ep_col] = str(new_ep)
+        if tp_col is not None:
+            all_values[player_row_idx][tp_col] = str(new_tp)
 
     # Re-read and reorder the section
     all_values = await ws.get_all_values()
     await _rewrite_section_sorted(ws, target_section, all_values)
 
-    logger.info("Promoted %s to %s in [%s], section reordered",
-                player.username, new_rank, player.sheet_name)
+    logger.info("Promoted %s to %s in [%s], points deducted, section reordered",
+                player.username, new_rank_upper, player.sheet_name)
+
+    result = req_msg + f"\n\nRank: **{player.rank}** → **{new_rank_upper}**"
+    return result
 
 
 async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[int, dict] | None:
