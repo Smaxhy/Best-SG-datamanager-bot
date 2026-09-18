@@ -130,19 +130,20 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
             old_rank = player.rank
             try:
-                await sheets.promote_rank(player, rank.value)
+                result_msg = await sheets.promote_rank(player, rank.value)
+            except ValueError as exc:
+                # Requirements not met
+                await interaction.followup.send(str(exc))
+                return
             except Exception as exc:
                 await interaction.followup.send(f"❌ Promotion failed: {exc}")
                 return
 
             embed = discord.Embed(
                 title="⬆️ Player Promoted",
-                description=(
-                    f"**{player.username}** ({player.lore_name})\n"
-                    f"**{old_rank}** → **{rank.value}**\n"
-                    f"Sheet: **{player.sheet_name}**"
-                ),
+                description=result_msg,
                 colour=discord.Colour.green(),
             )
+            embed.set_footer(text=f"Sheet: {player.sheet_name}")
             embed.add_field(name="By", value=interaction.user.mention)
             await interaction.followup.send(embed=embed)
