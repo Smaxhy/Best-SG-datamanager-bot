@@ -16,7 +16,7 @@ from discord import app_commands
 
 import config
 from services.database_service import init_db
-from commands import scan, stats, leaderboard, promote, say
+from commands import scan, stats, leaderboard, promote, say, listscan
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -55,6 +55,7 @@ class DataManagerBot(discord.Client):
         leaderboard.register(self.tree, self)
         promote.register(self.tree, self)
         say.register(self.tree, self)
+        listscan.register(self.tree, self)
 
         # Sync globally only
         await self.tree.sync()
