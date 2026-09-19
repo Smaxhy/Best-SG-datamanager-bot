@@ -81,9 +81,18 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         # Check bot can read the channel
         perms = channel.permissions_for(interaction.guild.me)
-        if not perms.read_message_history:
+        if not perms.view_channel or not perms.read_message_history:
             await interaction.response.send_message(
-                f"❌ I can't read message history in {channel.mention}.",
+                f"❌ I don't have permission to read message history in {channel.mention}. "
+                f"Check that the bot role has **View Channel** and **Read Message History** enabled.",
+                ephemeral=True,
+            )
+            return
+
+        # Channel restriction (if configured)
+        if config.ALLOWED_CHANNEL_IDS and channel.id not in config.ALLOWED_CHANNEL_IDS:
+            await interaction.response.send_message(
+                f"❌ Channel {channel.mention} is not in the allowed scan list.",
                 ephemeral=True,
             )
             return
