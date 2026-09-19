@@ -13,6 +13,7 @@ from discord import app_commands
 
 import config
 from services.discord_service import run_scan
+from services import database_service as db
 
 logger = logging.getLogger("bot.cmd.scan")
 
@@ -62,6 +63,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         # ── Acknowledge (we may take a while) ────────────────────
         await interaction.response.defer(ephemeral=False)
+
+        await db.log_command(
+            interaction.user.id, str(interaction.user), "scan",
+            details=f"#{channel.name}", channel_name=interaction.channel.name,
+        )
 
         try:
             result = await run_scan(channel, interaction.user)
