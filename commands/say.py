@@ -12,6 +12,7 @@ import discord
 from discord import app_commands
 
 import config
+from services import database_service as db
 
 
 def _has_permission(interaction: discord.Interaction) -> bool:
@@ -45,6 +46,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             return
 
         target = channel or interaction.channel
+
+        await db.log_command(
+            interaction.user.id, str(interaction.user), "say",
+            details=f"in #{target.name}", channel_name=interaction.channel.name,
+        )
 
         try:
             await target.send(message)
