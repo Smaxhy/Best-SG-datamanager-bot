@@ -104,6 +104,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         await interaction.response.defer()
 
         if detachment and subdivision:
+            await db.log_command(
+                interaction.user.id, str(interaction.user), "promote",
+                details=f"{username} → {detachment.name}/{subdivision.name} as {rank.value}",
+                channel_name=interaction.channel.name,
+            )
             # ── TRANSFER: move player to new detachment ──────────
             player = await sheets.find_player(username)
             if player is None:
@@ -146,6 +151,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         else:
             # ── RANK PROMOTION: change rank in current sheet ─────
+            await db.log_command(
+                interaction.user.id, str(interaction.user), "promote",
+                details=f"{username} → {rank.value}",
+                channel_name=interaction.channel.name,
+            )
             player = await sheets.find_player(username)
             if player is None:
                 await interaction.followup.send(f"❌ Player **{username}** not found.")
