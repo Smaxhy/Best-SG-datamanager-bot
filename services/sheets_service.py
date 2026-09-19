@@ -87,6 +87,10 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
                     headers["TP"] = c
                 elif v == "MP" and "MP" not in headers:
                     headers["MP"] = c
+                elif v == "EXAM" and "EXAM" not in headers:
+                    headers["EXAM"] = c
+                elif v == "SCOUTED" and "SCOUTED" not in headers:
+                    headers["SCOUTED"] = c
             sections.append({
                 "header_row": row_idx,
                 "username_col": ucol,
@@ -559,16 +563,68 @@ async def _clear_player_row(player: PlayerRow) -> None:
         await ws.update_cells(clear_cells, value_input_option="RAW")
 
 
+def _is_ancillary(sheet_name: str) -> bool:
+    """Check if a sheet is the Ancillary sheet (fuzzy)."""
+    return "ANCILLARY" in sheet_name.upper()
+
+
+def _is_rook_or_bastion(sheet_name: str) -> bool:
+    return "ROOK" in sheet_name.upper() or "BASTION" in sheet_name.upper()
+
+
 async def transfer_player(
     player: PlayerRow,
     dest_sheet: str,
     subdivision: str,
     new_rank: str = "RCT",
-) -> str:
+) -> dict:
     """
     Move a player from their current sheet to a new detachment/subdivision.
-    Clears old row, writes to new sheet, reorders by rank.
+
+    Two modes:
+    - Ancillary → Rook/Bastion: ranked PROMOTION — checks requirements,
+      deducts points, keeps remainder.
+    - Rook ↔ Bastion: lateral TRANSFER — keeps all points as-is.
+
+    Returns a dict with: message, mode ("promotion"|"transfer"), old_ep/tp/mp,
+    new_ep/tp/mp, deducted_ep/tp/mp, old_rank, new_rank.
     """
+    from_ancillary = _is_ancillary(player.sheet_name)
+    to_rook_bastion = _is_rook_or_bastion(dest_sheet)
+    lateral = _is_rook_or_bastion(player.sheet_name) and to_rook_bastion
+
+    # Determine point handling
+    if from_ancillary and to_rook_bastion:
+        mode = "promotion"
+        # Check promotion requirements
+        new_rank_upper = new_rank.strip().upper()
+        req = RANK_REQUIREMENTS.get(new_rank_upper)
+        if req:
+            eligible, req_msg = check_promotion_requirements(player, new_rank_upper)
+            if not eligible:
+                raise ValueError(req_msg)
+            dest_ep = player.ep - req["ep"]
+            dest_tp = player.tp - req["tp"]
+            dest_mp = player.mp - req["mp"]
+        else:
+            # No requirements for this rank (e.g. RCT) — keep all points
+            dest_ep = player.ep
+            dest_tp = player.tp
+            dest_mp = player.mp
+    elif lateral:
+        mode = "transfer"
+        # Carry all points across
+        dest_ep = player.ep
+        dest_tp = player.tp
+        dest_mp = player.mp
+    else:
+        # Fallback (e.g. Rook/Bastion → Ancillary, or any other combo) — reset
+        mode = "transfer"
+        dest_ep = 0
+        dest_tp = 0
+        dest_mp = 0
+
+    # Find empty row in destination
     result = await find_empty_row_in_section(dest_sheet, subdivision)
     if result is None:
         raise RuntimeError(
@@ -586,10 +642,10 @@ async def transfer_player(
     for key, value in [
         ("USERNAME", player.username),
         ("LORE NAME", player.lore_name),
-        ("RANK", new_rank),
-        ("EP", "0"),
-        ("TP", "0"),
-        ("MP", "0"),
+        ("RANK", new_rank.strip().upper()),
+        ("EP", str(dest_ep)),
+        ("TP", str(dest_tp)),
+        ("MP", str(dest_mp)),
     ]:
         col = dest_headers.get(key)
         if col is not None:
@@ -610,12 +666,201 @@ async def transfer_player(
             await _rewrite_section_sorted(ws_dest, section, all_values)
             break
 
-    logger.info("Transferred %s from %s to %s → %s row %d",
-                player.username, player.sheet_name, dest_sheet, subdivision, dest_row)
+    old_rank = player.rank
+    logger.info("Transferred %s from %s to %s → %s (mode=%s)",
+                player.username, player.sheet_name, dest_sheet, subdivision, mode)
 
-    return (
-        f"**{player.username}** ({player.lore_name})\n"
-        f"From: **{player.sheet_name}**\n"
-        f"To: **{dest_sheet}** → **{subdivision}** as **{new_rank}**\n"
-        f"EP/TP/MP reset to 0"
-    )
+    # Build result dict for the command to use
+    req_info = RANK_REQUIREMENTS.get(new_rank.strip().upper())
+    deducted_ep = req_info["ep"] if (mode == "promotion" and req_info) else 0
+    deducted_tp = req_info["tp"] if (mode == "promotion" and req_info) else 0
+    deducted_mp = req_info["mp"] if (mode == "promotion" and req_info) else 0
+
+    if mode == "promotion":
+        msg = (
+            f"**{player.username}** ({player.lore_name})\n"
+            f"From: **{player.sheet_name}**\n"
+            f"To: **{dest_sheet}** → **{subdivision}** as **{new_rank.upper()}**\n"
+            f"Rank: **{old_rank}** → **{new_rank.upper()}**\n\n"
+            f"**Point Conversion:**\n"
+            f"EP: {player.ep} - {deducted_ep} = **{dest_ep}** remaining\n"
+            f"TP: {player.tp} - {deducted_tp} = **{dest_tp}** remaining\n"
+            f"MP: {player.mp} - {deducted_mp} = **{dest_mp}** remaining"
+        )
+    elif lateral:
+        msg = (
+            f"**{player.username}** ({player.lore_name})\n"
+            f"From: **{player.sheet_name}**\n"
+            f"To: **{dest_sheet}** → **{subdivision}** as **{new_rank.upper()}**\n\n"
+            f"**Points carried over:**\n"
+            f"EP: **{dest_ep}** | TP: **{dest_tp}** | MP: **{dest_mp}**"
+        )
+    else:
+        msg = (
+            f"**{player.username}** ({player.lore_name})\n"
+            f"From: **{player.sheet_name}**\n"
+            f"To: **{dest_sheet}** → **{subdivision}** as **{new_rank.upper()}**\n"
+            f"EP/TP/MP reset to 0"
+        )
+
+    return {
+        "message": msg,
+        "mode": mode,
+        "old_rank": old_rank,
+        "new_rank": new_rank.strip().upper(),
+        "old_ep": player.ep, "old_tp": player.tp, "old_mp": player.mp,
+        "new_ep": dest_ep, "new_tp": dest_tp, "new_mp": dest_mp,
+        "deducted_ep": deducted_ep, "deducted_tp": deducted_tp, "deducted_mp": deducted_mp,
+    }
+
+
+# ── Deathlog: find and remove player from ALL sheets ────────────────
+
+async def find_all_player_rows(username: str) -> list[PlayerRow]:
+    """Find a player across ALL sheets — returns every row they appear in."""
+    target = username.strip().lower()
+    found: list[PlayerRow] = []
+
+    for sheet_name in config.DETACHMENT_SHEETS:
+        try:
+            ws = await _get_worksheet_safe(sheet_name)
+            if ws is None:
+                continue
+            all_values = await ws.get_all_values()
+            sections = _find_table_sections(all_values)
+
+            for section in sections:
+                header_row = section["header_row"]
+                username_col = section["username_col"]
+                headers = section["headers"]
+                lore_col = headers.get("LORE NAME")
+
+                for row_idx in range(header_row + 1, len(all_values)):
+                    row = all_values[row_idx]
+                    if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                        break
+                    if username_col >= len(row):
+                        continue
+
+                    cell_user = row[username_col].strip().lower()
+                    cell_lore = ""
+                    if lore_col is not None and lore_col < len(row):
+                        cell_lore = row[lore_col].strip().lower()
+
+                    # Match by username, full lore name, or first name
+                    matched = False
+                    if cell_user == target:
+                        matched = True
+                    elif cell_lore and cell_lore == target:
+                        matched = True
+                    elif cell_lore:
+                        parts = cell_lore.split()
+                        if parts and parts[0] == target:
+                            matched = True
+
+                    if matched and cell_user:
+                        found.append(_build_player(row, headers, ws.title, row_idx))
+
+        except Exception:
+            logger.exception("Error searching sheet '%s' for deathlog.", sheet_name)
+
+    return found
+
+
+async def remove_player_rows(players: list[PlayerRow]) -> int:
+    """Clear all given player rows from their sheets. Returns count removed."""
+    removed = 0
+    for player in players:
+        try:
+            await _clear_player_row(player)
+            removed += 1
+            logger.info("Deathlog: removed %s from %s row %d",
+                        player.username, player.sheet_name, player.row_index)
+        except Exception:
+            logger.exception("Failed to remove %s from %s", player.username, player.sheet_name)
+    return removed
+
+
+# ── Examcheck: set EXAM checkbox in Ancillary ──────────────────────
+
+async def set_exam_checkmark(username: str) -> bool:
+    """
+    Find a player in the Ancillary sheet and set their EXAM cell to '✓'.
+    Returns True if found and updated.
+    """
+    for sheet_name in config.DETACHMENT_SHEETS:
+        if not _is_ancillary(sheet_name):
+            continue
+
+        ws = await _get_worksheet_safe(sheet_name)
+        if ws is None:
+            continue
+
+        all_values = await ws.get_all_values()
+        sections = _find_table_sections(all_values)
+        target = username.strip().lower()
+
+        for section in sections:
+            header_row = section["header_row"]
+            username_col = section["username_col"]
+            headers = section["headers"]
+            exam_col = headers.get("EXAM")
+            if exam_col is None:
+                logger.warning("No EXAM column found in section at row %d of %s",
+                               header_row + 1, sheet_name)
+                continue
+
+            for row_idx in range(header_row + 1, len(all_values)):
+                row = all_values[row_idx]
+                if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                    break
+                if username_col >= len(row):
+                    continue
+
+                cell_user = row[username_col].strip().lower()
+                if cell_user == target:
+                    # Set the EXAM cell
+                    await ws.update_cell(row_idx + 1, exam_col + 1, "✓")
+                    logger.info("Set EXAM checkmark for %s in %s row %d",
+                                username, sheet_name, row_idx + 1)
+                    return True
+
+    return False
+
+
+async def find_ancillary_player(username: str) -> PlayerRow | None:
+    """Find a player specifically in the Ancillary sheet."""
+    target = username.strip().lower()
+    for sheet_name in config.DETACHMENT_SHEETS:
+        if not _is_ancillary(sheet_name):
+            continue
+
+        ws = await _get_worksheet_safe(sheet_name)
+        if ws is None:
+            continue
+
+        all_values = await ws.get_all_values()
+        sections = _find_table_sections(all_values)
+
+        for section in sections:
+            header_row = section["header_row"]
+            username_col = section["username_col"]
+            headers = section["headers"]
+
+            for row_idx in range(header_row + 1, len(all_values)):
+                row = all_values[row_idx]
+                if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                    break
+                if username_col >= len(row):
+                    continue
+
+                cell_user = row[username_col].strip().lower()
+                lore_col = headers.get("LORE NAME")
+                cell_lore = ""
+                if lore_col is not None and lore_col < len(row):
+                    cell_lore = row[lore_col].strip().lower()
+
+                if cell_user == target or cell_lore == target:
+                    return _build_player(row, headers, ws.title, row_idx)
+
+    return None
