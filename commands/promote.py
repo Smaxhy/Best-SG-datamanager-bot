@@ -103,6 +103,16 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         await interaction.response.defer()
 
+        # Check ranklock
+        lock = await db.is_ranklocked(username)
+        if lock:
+            await interaction.followup.send(
+                f"🔒 **{username}** is rank-locked by **{lock.locked_by_name}**"
+                + (f" — {lock.reason}" if lock.reason else "")
+                + "\nUse `/unranklock` to unlock them first."
+            )
+            return
+
         if detachment and subdivision:
             await db.log_command(
                 interaction.user.id, str(interaction.user), "promote",
