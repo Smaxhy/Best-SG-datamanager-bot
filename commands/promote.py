@@ -23,7 +23,11 @@ def _has_permission(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return False
     role_ids = {r.id for r in interaction.user.roles}
-    return config.DATA_MANAGER_ROLE_ID in role_ids or config.STAFF_ROLE_ID in role_ids
+    return (
+        config.DATA_MANAGER_ROLE_ID in role_ids
+        or config.STAFF_ROLE_ID in role_ids
+        or config.NCO_ROLE_ID in role_ids
+    )
 
 
 PROMOTION_CHANNEL_ID = 1511781917693972601
