@@ -17,6 +17,7 @@ import discord
 from discord import app_commands
 
 import config
+from services import database_service as db
 
 logger = logging.getLogger("bot.listscan")
 
@@ -63,6 +64,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             return
 
         await interaction.response.defer()
+
+        await db.log_command(
+            interaction.user.id, str(interaction.user), "listscan",
+            details=f"#{channel.name} ({minutes}min)", channel_name=interaction.channel.name,
+        )
 
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
         usernames = []
