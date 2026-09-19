@@ -114,12 +114,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             return
 
         if detachment and subdivision:
-            await db.log_command(
-                interaction.user.id, str(interaction.user), "promote",
-                details=f"{username} → {detachment.name}/{subdivision.name} as {rank.value}",
-                channel_name=interaction.channel.name,
-            )
-            # ── TRANSFER: move player to new detachment ──────────
+            # ── TRANSFER / PROMOTION: move player to new detachment ──
             player = await sheets.find_player(username)
             if player is None:
                 await interaction.followup.send(f"❌ Player **{username}** not found.")
@@ -132,19 +127,55 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                     subdivision=subdivision.value,
                     new_rank=rank.value,
                 )
+            except ValueError as exc:
+                # Requirements not met (promotion from Ancillary)
+                await interaction.followup.send(str(exc))
+                return
             except Exception as exc:
                 await interaction.followup.send(f"❌ Transfer failed: {exc}")
                 return
 
-            embed = discord.Embed(
-                title="🔄 Player Transferred",
-                description=result,
-                colour=discord.Colour.blue(),
+            mode = result["mode"]
+            is_promo = mode == "promotion"
+
+            # Log command with point conversion details
+            if is_promo:
+                detail_str = (
+                    f"{username} PROMOTED {player.sheet_name} → "
+                    f"{detachment.name}/{subdivision.name} as {rank.value} | "
+                    f"EP {result['old_ep']}→{result['new_ep']} "
+                    f"TP {result['old_tp']}→{result['new_tp']} "
+                    f"MP {result['old_mp']}→{result['new_mp']}"
+                )
+            else:
+                detail_str = (
+                    f"{username} TRANSFERRED {player.sheet_name} → "
+                    f"{detachment.name}/{subdivision.name} as {rank.value} | "
+                    f"EP {result['new_ep']} TP {result['new_tp']} MP {result['new_mp']}"
+                )
+
+            await db.log_command(
+                interaction.user.id, str(interaction.user), "promote",
+                details=detail_str,
+                channel_name=interaction.channel.name,
             )
+
+            if is_promo:
+                embed = discord.Embed(
+                    title="⬆️ Player Promoted & Transferred",
+                    description=result["message"],
+                    colour=discord.Colour.green(),
+                )
+            else:
+                embed = discord.Embed(
+                    title="🔄 Player Transferred",
+                    description=result["message"],
+                    colour=discord.Colour.blue(),
+                )
             embed.add_field(name="By", value=interaction.user.mention)
             await interaction.followup.send(embed=embed)
 
-            # Log transfer as weekly DM score
+            # Log as weekly DM score
             await db.increment_dm_score(interaction.user.id, str(interaction.user), logs=1)
             await db.increment_dm_scans(interaction.user.id, str(interaction.user))
 
@@ -152,10 +183,23 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             try:
                 announce_ch = bot.get_channel(PROMOTION_CHANNEL_ID)
                 if announce_ch:
-                    await announce_ch.send(
-                        f"📋 **{player.username}** ({player.lore_name}) transferred to "
-                        f"**{detachment.name}** → **{subdivision.name}** as **{rank.value}**"
-                    )
+                    if is_promo:
+                        announce_msg = (
+                            f"⬆️ **{player.username}** ({player.lore_name}) promoted "
+                            f"**{result['old_rank']}** → **{result['new_rank']}** "
+                            f"and transferred to **{detachment.name}** → **{subdivision.name}**\n"
+                            f"Points: EP {result['old_ep']}→{result['new_ep']} | "
+                            f"TP {result['old_tp']}→{result['new_tp']} | "
+                            f"MP {result['old_mp']}→{result['new_mp']}"
+                        )
+                    else:
+                        announce_msg = (
+                            f"🔄 **{player.username}** ({player.lore_name}) transferred to "
+                            f"**{detachment.name}** → **{subdivision.name}** as **{rank.value}**\n"
+                            f"Points: EP {result['new_ep']} | "
+                            f"TP {result['new_tp']} | MP {result['new_mp']}"
+                        )
+                    await announce_ch.send(announce_msg)
             except Exception:
                 pass
 
