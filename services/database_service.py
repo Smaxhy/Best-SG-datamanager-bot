@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import config
-from models import Base, ProcessedLog, DataManagerStats, ScanHistory, CommandLog
+from models import Base, ProcessedLog, DataManagerStats, ScanHistory, CommandLog, RankLock
 
 logger = logging.getLogger("bot.database")
 
@@ -327,5 +327,63 @@ async def get_recent_commands(hours: int = 24) -> list[CommandLog]:
             .where(CommandLog.executed_at >= cutoff)
             .order_by(CommandLog.executed_at.desc())
         )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+# ── Rank lock ────────────────────────────────────────────────────────
+
+async def ranklock_player(username: str, locked_by_id: int, locked_by_name: str, reason: str | None = None, hours: int | None = None) -> bool:
+    """Lock a player. Returns True if newly locked, False if already locked."""
+    async with async_session() as session:
+        stmt = select(RankLock).where(RankLock.username == username.lower())
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if existing:
+            return False
+        expires = datetime.now(timezone.utc) + timedelta(hours=hours) if hours else None
+        lock = RankLock(
+            username=username.lower(),
+            locked_by_id=locked_by_id,
+            locked_by_name=locked_by_name,
+            reason=reason,
+            expires_at=expires,
+        )
+        session.add(lock)
+        await session.commit()
+        return True
+
+
+async def unranklock_player(username: str) -> bool:
+    """Unlock a player. Returns True if unlocked, False if wasn't locked."""
+    async with async_session() as session:
+        stmt = select(RankLock).where(RankLock.username == username.lower())
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if not existing:
+            return False
+        await session.delete(existing)
+        await session.commit()
+        return True
+
+
+async def is_ranklocked(username: str) -> RankLock | None:
+    """Check if a player is rank-locked. Auto-removes expired locks."""
+    async with async_session() as session:
+        stmt = select(RankLock).where(RankLock.username == username.lower())
+        result = await session.execute(stmt)
+        lock = result.scalar_one_or_none()
+        if lock is None:
+            return None
+        # Check if expired
+        if lock.expires_at and datetime.now(timezone.utc) >= lock.expires_at:
+            await session.delete(lock)
+            await session.commit()
+            return None
+        return lock
+
+
+async def get_all_ranklocks() -> list[RankLock]:
+    async with async_session() as session:
+        stmt = select(RankLock).order_by(RankLock.locked_at.desc())
         result = await session.execute(stmt)
         return list(result.scalars().all())
