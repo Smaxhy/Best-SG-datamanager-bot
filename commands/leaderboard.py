@@ -24,7 +24,7 @@ def _has_staff(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return False
     role_ids = {r.id for r in interaction.user.roles}
-    return config.STAFF_ROLE_ID in role_ids
+    return config.STAFF_ROLE_ID in role_ids or config.NCO_ROLE_ID in role_ids
 
 
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
