@@ -142,14 +142,29 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             nickname = entry["nickname"]
             score = entry["score"]
 
-            # Try to find them in Ancillary by their Discord nickname
-            player = await sheets.find_ancillary_player(nickname)
+            # Discord nicknames are usually "Lore Name | Username"
+            # Split on | and try each part
+            parts = [p.strip() for p in nickname.split("|") if p.strip()]
 
-            # If not found, try just the first word of the nickname
-            # (nicknames might be like "John Smith | Regiment" or "John_Smith")
-            if player is None and " " in nickname:
-                first_word = nickname.split()[0]
-                player = await sheets.find_ancillary_player(first_word)
+            player = None
+
+            # Try each part of the nickname (username is usually after |)
+            for part in reversed(parts):
+                player = await sheets.find_ancillary_player(part)
+                if player:
+                    break
+
+            # If still not found, try the full nickname as-is
+            if player is None:
+                player = await sheets.find_ancillary_player(nickname)
+
+            # Last resort: try first word of each part
+            if player is None:
+                for part in parts:
+                    first_word = part.split()[0] if " " in part else part
+                    player = await sheets.find_ancillary_player(first_word)
+                    if player:
+                        break
 
             if player is None:
                 lock_errors.append(
