@@ -7,13 +7,13 @@ Uses SQLAlchemy 2.0 async with aiosqlite (dev) or asyncpg (prod).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import config
-from models import Base, ProcessedLog, DataManagerStats, ScanHistory
+from models import Base, ProcessedLog, DataManagerStats, ScanHistory, CommandLog
 
 logger = logging.getLogger("bot.database")
 
@@ -300,3 +300,32 @@ async def add_dm_logs(dm_id: int, dm_name: str, logs: int) -> int:
             row.discord_username = dm_name
         await session.commit()
         return row.logs_processed
+
+# ── Command logging ──────────────────────────────────────────────────
+
+async def log_command(
+    user_id: int, username: str, command: str,
+    details: str | None = None, channel_name: str = "",
+) -> None:
+    async with async_session() as session:
+        entry = CommandLog(
+            discord_user_id=user_id,
+            discord_username=username,
+            command=command,
+            details=details,
+            channel_name=channel_name,
+        )
+        session.add(entry)
+        await session.commit()
+
+
+async def get_recent_commands(hours: int = 24) -> list[CommandLog]:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    async with async_session() as session:
+        stmt = (
+            select(CommandLog)
+            .where(CommandLog.executed_at >= cutoff)
+            .order_by(CommandLog.executed_at.desc())
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
