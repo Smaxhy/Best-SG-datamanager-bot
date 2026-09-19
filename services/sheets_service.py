@@ -785,7 +785,7 @@ async def remove_player_rows(players: list[PlayerRow]) -> int:
 
 async def set_exam_checkmark(username: str) -> bool:
     """
-    Find a player in the Ancillary sheet and set their EXAM cell to '✓'.
+    Find a player in the Ancillary sheet and set their EXAM checkbox to TRUE.
     Returns True if found and updated.
     """
     for sheet_name in config.DETACHMENT_SHEETS:
@@ -819,8 +819,8 @@ async def set_exam_checkmark(username: str) -> bool:
 
                 cell_user = row[username_col].strip().lower()
                 if cell_user == target:
-                    # Set the EXAM cell
-                    await ws.update_cell(row_idx + 1, exam_col + 1, "✓")
+                    # Set the EXAM checkbox to TRUE
+                    await ws.update_cell(row_idx + 1, exam_col + 1, True)
                     logger.info("Set EXAM checkmark for %s in %s row %d",
                                 username, sheet_name, row_idx + 1)
                     return True
