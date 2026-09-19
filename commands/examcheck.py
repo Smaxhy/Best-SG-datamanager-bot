@@ -1,11 +1,12 @@
 """
-/examcheck command — scan a channel for exam scores in Discord nicknames.
+/examcheck command — scan a channel for exam results.
 
-Looks for patterns like "12/14", "13/14", "14/14" in member nicknames
-mentioned in the channel within the chosen time window.
-
-If score >= 12/14 → auto-lock the player in Ancillary + checkmark EXAM box.
-If score < 12/14  → report them as needing to retake.
+Expected message format: @member XX/14
+The bot grabs the mentioned member's Discord nickname, searches the
+Ancillary sheet for that name, and if the score >= 12/14:
+  - checkmarks the EXAM box
+  - rank-locks the player
+If < 12/14 → reports them as needing to retake.
 
 Usage:  /examcheck channel:#exam-results duration:24
 """
@@ -40,19 +41,11 @@ def _has_permission(interaction: discord.Interaction) -> bool:
     )
 
 
-def _extract_exam_score(text: str) -> int | None:
-    """Extract the numerator from a '/14' score pattern. Returns None if no match."""
-    m = EXAM_SCORE_RE.search(text)
-    if m:
-        return int(m.group(1))
-    return None
-
-
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
     @tree.command(
         name="examcheck",
-        description="Scan a channel for exam scores in nicknames — auto-lock + checkmark passing players",
+        description="Scan a channel for exam scores — auto-lock + checkmark passing players in Ancillary",
     )
     @app_commands.describe(
         channel="The Discord channel to scan for exam results",
@@ -101,79 +94,68 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=duration.value)
 
-        # Scan messages for member mentions / nicknames with exam scores
-        passed: list[dict] = []     # {"member": ..., "username": ..., "score": int}
-        failed: list[dict] = []
-        seen_members: set[int] = set()
+        # Collect mentioned members + their scores from message content
+        # Format expected: @member XX/14  (the score is in the message text)
+        results: dict[int, dict] = {}  # member_id -> {member, nickname, score}
 
         async for message in channel.history(after=cutoff, limit=5000):
-            # Check the message author's nickname
-            if message.author.id not in seen_members:
-                nick = message.author.display_name
-                score = _extract_exam_score(nick)
-                if score is not None:
-                    seen_members.add(message.author.id)
-                    entry = {
-                        "member": message.author,
-                        "display_name": nick,
-                        "score": score,
-                    }
-                    if score >= 12:
-                        passed.append(entry)
-                    else:
-                        failed.append(entry)
+            if not message.mentions:
+                continue
 
-            # Also check mentioned members' nicknames
-            for member in message.mentions:
-                if member.id in seen_members:
+            # Find all scores in the message content
+            scores_in_msg = EXAM_SCORE_RE.findall(message.content)
+            if not scores_in_msg:
+                continue
+
+            # If there's one mention and one score, pair them
+            # If multiple mentions, try to pair each with a score in order
+            mentions = message.mentions
+            for i, member in enumerate(mentions):
+                if member.id in results:
+                    continue  # already got this person, skip dupes
+                if member.bot:
                     continue
-                nick = member.display_name
-                score = _extract_exam_score(nick)
-                if score is not None:
-                    seen_members.add(member.id)
-                    entry = {
-                        "member": member,
-                        "display_name": nick,
-                        "score": score,
-                    }
-                    if score >= 12:
-                        passed.append(entry)
-                    else:
-                        failed.append(entry)
 
-            # Check message content for nickname-like patterns with scores
-            # e.g. "PlayerName 13/14"
-            content_matches = EXAM_SCORE_RE.finditer(message.content)
-            for m in content_matches:
-                # Already handled via author/mentions — skip pure content dupes
-                pass
+                # Grab the score — if multiple mentions, try matching by position
+                score_idx = min(i, len(scores_in_msg) - 1)
+                if score_idx < 0:
+                    continue
+                score = int(scores_in_msg[score_idx])
 
-        # Process passing players: auto-lock + checkmark EXAM in Ancillary
+                # Get their server nickname (display_name = nickname if set, else username)
+                nickname = member.display_name
+
+                results[member.id] = {
+                    "member": member,
+                    "nickname": nickname,
+                    "score": score,
+                }
+
+        # Now process everyone — split into passed/failed
+        passed = {mid: r for mid, r in results.items() if r["score"] >= 12}
+        failed = {mid: r for mid, r in results.items() if r["score"] < 12}
+
         locked_players = []
         lock_errors = []
 
-        for entry in passed:
-            display = entry["display_name"]
+        for mid, entry in passed.items():
+            nickname = entry["nickname"]
             score = entry["score"]
 
-            # Try to find them in Ancillary by their display name (strip score suffix)
-            # Nicknames often look like "Username 13/14" — strip the score part
-            clean_name = EXAM_SCORE_RE.sub("", display).strip()
-            # Also try stripping common separators
-            clean_name = clean_name.rstrip("-—|·").strip()
+            # Try to find them in Ancillary by their Discord nickname
+            player = await sheets.find_ancillary_player(nickname)
 
-            if not clean_name:
-                lock_errors.append(f"⚠️ Could not extract name from `{display}`")
-                continue
-
-            # Find player in Ancillary
-            player = await sheets.find_ancillary_player(clean_name)
-            if player is None:
-                # Try the full display name as fallback
-                player = await sheets.find_ancillary_player(display)
+            # If not found, try just the first word of the nickname
+            # (nicknames might be like "John Smith | Regiment" or "John_Smith")
+            if player is None and " " in nickname:
+                first_word = nickname.split()[0]
+                player = await sheets.find_ancillary_player(first_word)
 
             if player is None:
-                lock_errors.append(f"⚠️ **{clean_name}** (`{display}`) — not found in Ancillary")
+                lock_errors.append(
+                    f"⚠️ **{nickname}** ({entry['member'].mention}) — "
+                    f"scored {score}/14 but not found in Ancillary sheet"
+                )
                 continue
 
             # Set EXAM checkmark
@@ -196,7 +178,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 continue
 
             status = "✅ locked" if was_locked else "🔒 already locked"
-            exam_status = "+ exam ✓" if marked else "(no EXAM col)"
+            exam_status = "+ exam ✓" if marked else "(no EXAM col found)"
             locked_players.append(
                 f"**{player.username}** ({player.lore_name}) — "
                 f"{score}/14 — {status} {exam_status}"
@@ -220,24 +202,31 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         )
         embed.add_field(name="Channel", value=channel.mention, inline=True)
         embed.add_field(name="Duration", value=f"Last {duration.value} hours", inline=True)
-        embed.add_field(name="Members scanned", value=str(len(seen_members)), inline=True)
+        embed.add_field(name="Members found", value=str(len(results)), inline=True)
 
         if locked_players:
-            # Truncate if too long for embed
             text = "\n".join(locked_players[:20])
             if len(locked_players) > 20:
                 text += f"\n… and {len(locked_players) - 20} more"
-            embed.add_field(name=f"✅ Passed & Locked ({len(locked_players)})", value=text, inline=False)
+            embed.add_field(
+                name=f"✅ Passed & Locked ({len(locked_players)})",
+                value=text, inline=False,
+            )
 
         if failed:
             fail_lines = []
-            for entry in failed[:20]:
-                clean = EXAM_SCORE_RE.sub("", entry["display_name"]).strip().rstrip("-—|·").strip()
-                fail_lines.append(f"**{clean or entry['display_name']}** — {entry['score']}/14 ❌")
+            for mid, entry in list(failed.items())[:20]:
+                fail_lines.append(
+                    f"**{entry['nickname']}** ({entry['member'].mention}) — "
+                    f"{entry['score']}/14 ❌"
+                )
             text = "\n".join(fail_lines)
             if len(failed) > 20:
                 text += f"\n… and {len(failed) - 20} more"
-            embed.add_field(name=f"❌ Failed — Retake Required ({len(failed)})", value=text, inline=False)
+            embed.add_field(
+                name=f"❌ Failed — Retake Required ({len(failed)})",
+                value=text, inline=False,
+            )
 
         if lock_errors:
             text = "\n".join(lock_errors[:10])
@@ -245,17 +234,22 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 text += f"\n… and {len(lock_errors) - 10} more"
             embed.add_field(name="⚠️ Issues", value=text, inline=False)
 
-        if not passed and not failed:
-            embed.description = "No exam scores found in nicknames during this period."
+        if not results:
+            embed.description = (
+                "No exam scores found. Make sure messages contain a @mention "
+                "followed by a score like `13/14`."
+            )
 
         embed.set_footer(text=f"By {interaction.user}")
         await interaction.followup.send(embed=embed)
 
-        # Send DMs or channel messages to failed members telling them to retake
+        # Post retake notice for failed members
         if failed:
             retake_lines = []
-            for entry in failed:
-                member = entry["member"]
-                retake_lines.append(f"{member.mention} — scored **{entry['score']}/14**, needs to retake the exam.")
-            retake_msg = "**Exam Retake Required:**\n" + "\n".join(retake_lines[:25])
+            for mid, entry in list(failed.items())[:25]:
+                retake_lines.append(
+                    f"{entry['member'].mention} — scored **{entry['score']}/14**, "
+                    f"needs to retake the exam."
+                )
+            retake_msg = "**Exam Retake Required:**\n" + "\n".join(retake_lines)
             await interaction.followup.send(retake_msg)
