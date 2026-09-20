@@ -135,8 +135,8 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         passed = {mid: r for mid, r in results.items() if r["score"] >= 12}
         failed = {mid: r for mid, r in results.items() if r["score"] < 12}
 
-        locked_players = []
-        lock_errors = []
+        passed_players = []
+        check_errors = []
 
         for mid, entry in passed.items():
             nickname = entry["nickname"]
@@ -167,7 +167,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                         break
 
             if player is None:
-                lock_errors.append(
+                check_errors.append(
                     f"⚠️ **{nickname}** ({entry['member'].mention}) — "
                     f"scored {score}/14 but not found in Ancillary sheet"
                 )
@@ -177,27 +177,17 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             try:
                 marked = await sheets.set_exam_checkmark(player.username)
             except Exception as exc:
-                lock_errors.append(f"⚠️ **{player.username}** — exam checkmark failed: {exc}")
-                marked = False
-
-            # Rank-lock the player
-            try:
-                was_locked = await db.ranklock_player(
-                    player.username,
-                    locked_by_id=interaction.user.id,
-                    locked_by_name=str(interaction.user),
-                    reason=f"Exam passed ({score}/14)",
-                )
-            except Exception as exc:
-                lock_errors.append(f"⚠️ **{player.username}** — lock failed: {exc}")
+                check_errors.append(f"⚠️ **{player.username}** — exam checkmark failed: {exc}")
                 continue
 
-            status = "✅ locked" if was_locked else "🔒 already locked"
-            exam_status = "+ exam ✓" if marked else "(no EXAM col found)"
-            locked_players.append(
-                f"**{player.username}** ({player.lore_name}) — "
-                f"{score}/14 — {status} {exam_status}"
-            )
+            if marked:
+                passed_players.append(
+                    f"**{player.username}** ({player.lore_name}) — {score}/14 ✅ exam checked"
+                )
+            else:
+                check_errors.append(
+                    f"⚠️ **{player.username}** — no EXAM column found in sheet"
+                )
 
         # Log the command
         await db.log_command(
@@ -205,7 +195,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             details=(
                 f"#{channel.name} last {duration.value}h | "
                 f"{len(passed)} passed, {len(failed)} failed, "
-                f"{len(locked_players)} locked"
+                f"{len(passed_players)} checked"
             ),
             channel_name=interaction.channel.name,
         )
@@ -219,12 +209,12 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         embed.add_field(name="Duration", value=f"Last {duration.value} hours", inline=True)
         embed.add_field(name="Members found", value=str(len(results)), inline=True)
 
-        if locked_players:
-            text = "\n".join(locked_players[:20])
-            if len(locked_players) > 20:
-                text += f"\n… and {len(locked_players) - 20} more"
+        if passed_players:
+            text = "\n".join(passed_players[:20])
+            if len(passed_players) > 20:
+                text += f"\n… and {len(passed_players) - 20} more"
             embed.add_field(
-                name=f"✅ Passed & Locked ({len(locked_players)})",
+                name=f"✅ Passed — Exam Checked ({len(passed_players)})",
                 value=text, inline=False,
             )
 
@@ -243,10 +233,10 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 value=text, inline=False,
             )
 
-        if lock_errors:
-            text = "\n".join(lock_errors[:10])
-            if len(lock_errors) > 10:
-                text += f"\n… and {len(lock_errors) - 10} more"
+        if check_errors:
+            text = "\n".join(check_errors[:10])
+            if len(check_errors) > 10:
+                text += f"\n… and {len(check_errors) - 10} more"
             embed.add_field(name="⚠️ Issues", value=text, inline=False)
 
         if not results:
