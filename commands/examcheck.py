@@ -102,33 +102,54 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             if not message.mentions:
                 continue
 
-            # Find all scores in the message content
-            scores_in_msg = EXAM_SCORE_RE.findall(message.content)
-            if not scores_in_msg:
+            content = message.content
+            if not content:
                 continue
 
-            # If there's one mention and one score, pair them
-            # If multiple mentions, try to pair each with a score in order
-            mentions = message.mentions
-            for i, member in enumerate(mentions):
+            # Find all score positions in the text
+            score_matches = list(EXAM_SCORE_RE.finditer(content))
+            if not score_matches:
+                continue
+
+            # Find each mention's position in the raw text and pair with nearest score AFTER it
+            for member in message.mentions:
                 if member.id in results:
-                    continue  # already got this person, skip dupes
+                    continue
                 if member.bot:
                     continue
 
-                # Grab the score — if multiple mentions, try matching by position
-                score_idx = min(i, len(scores_in_msg) - 1)
-                if score_idx < 0:
-                    continue
-                score = int(scores_in_msg[score_idx])
+                # Discord mentions appear as <@ID> or <@!ID> in raw content
+                mention_patterns = [f"<@{member.id}>", f"<@!{member.id}>"]
+                mention_pos = -1
+                for pat in mention_patterns:
+                    pos = content.find(pat)
+                    if pos != -1:
+                        mention_pos = pos + len(pat)
+                        break
 
-                # Get their server nickname (display_name = nickname if set, else username)
+                if mention_pos == -1:
+                    continue
+
+                # Find the closest score that comes AFTER this mention
+                best_score = None
+                best_dist = float("inf")
+                for m in score_matches:
+                    if m.start() >= mention_pos:
+                        dist = m.start() - mention_pos
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_score = int(m.group(1))
+                            break  # first one after is the closest
+
+                if best_score is None:
+                    continue
+
                 nickname = member.display_name
 
                 results[member.id] = {
                     "member": member,
                     "nickname": nickname,
-                    "score": score,
+                    "score": best_score,
                 }
 
         # Now process everyone — split into passed/failed
