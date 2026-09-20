@@ -57,7 +57,14 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         await interaction.response.defer(ephemeral=True)
 
-        deleted = await interaction.channel.purge(limit=amount)
+        # Only delete messages from the last 3 days
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+
+        deleted = await interaction.channel.purge(
+            limit=amount,
+            after=cutoff,
+        )
 
         await db.log_command(
             interaction.user.id, str(interaction.user), "purge",
