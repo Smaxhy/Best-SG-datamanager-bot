@@ -134,6 +134,31 @@ async def run_scan(
             )
             continue
 
+        # ── Ranklock check — skip stat updates for locked players ──
+        lock = await db.is_ranklocked(player.username)
+        if lock:
+            result.flagged_messages.append(
+                f"🔒 **{parsed.username}** is rank-locked"
+                + (f" ({lock.reason})" if lock.reason else "")
+                + " — EP/TP/MP skipped."
+            )
+            # Still record as processed so we don't flag the same message again
+            try:
+                await db.record_processed_log(
+                    message_id=message.id,
+                    channel_id=channel.id,
+                    dm_id=dm_user.id,
+                    dm_name=str(dm_user),
+                    username=parsed.username,
+                    lore_name=parsed.lore_name,
+                    ep=0, tp=0, mp=0,
+                    detachment=player.sheet_name,
+                    status="skipped_ranklocked",
+                )
+            except Exception:
+                pass
+            continue
+
         # ── Lore name validation (accepts partial/first-name matches) ──
         if parsed.lore_name and player.lore_name:
             log_lore = parsed.lore_name.strip().lower()
