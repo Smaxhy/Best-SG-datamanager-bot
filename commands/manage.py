@@ -28,7 +28,7 @@ def _has_permission(interaction: discord.Interaction) -> bool:
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
     # ── /ranklock ────────────────────────────────────────────────
-    @tree.command(name="ranklock", description="Prevent a player from being promoted")
+    @tree.command(name="ranklock", description="Block a player from promotions AND earning EP/TP/MP from scans")
     @app_commands.describe(
         username="The player's in-game username",
         reason="(Optional) Why they're locked",
@@ -44,7 +44,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
 
         locked = await db.ranklock_player(
             username, interaction.user.id, str(interaction.user), reason, hours
