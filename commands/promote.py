@@ -183,16 +183,20 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             try:
                 announce_ch = bot.get_channel(PROMOTION_CHANNEL_ID)
                 if announce_ch:
+                    old_rank = result['old_rank'] or "RCT"
+                    new_rank = result['new_rank']
+                    source = player.sheet_name
+
                     if is_promo:
                         announce_msg = (
                             f"⬆️ **{player.username}** ({player.lore_name}) promoted "
-                            f"**{result['old_rank']}** → **{result['new_rank']}** "
-                            f"and transferred to **{detachment.name}**"
+                            f"**{old_rank}** → **{new_rank}** "
+                            f"from **{source}** → **{detachment.name}**"
                         )
                     else:
                         announce_msg = (
-                            f"🔄 **{player.username}** ({player.lore_name}) transferred to "
-                            f"**{detachment.name}** as **{rank.value}**"
+                            f"🔄 **{player.username}** ({player.lore_name}) transferred "
+                            f"from **{source}** → **{detachment.name}** as **{new_rank}**"
                         )
                     await announce_ch.send(announce_msg)
             except Exception:
