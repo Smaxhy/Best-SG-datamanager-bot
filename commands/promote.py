@@ -179,7 +179,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             await db.increment_dm_score(interaction.user.id, str(interaction.user), logs=1)
             await db.increment_dm_scans(interaction.user.id, str(interaction.user))
 
-            # Announce in promotions channel
+            # Announce in promotions channel (clean, no points or subdivision detail)
             try:
                 announce_ch = bot.get_channel(PROMOTION_CHANNEL_ID)
                 if announce_ch:
@@ -187,17 +187,12 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                         announce_msg = (
                             f"⬆️ **{player.username}** ({player.lore_name}) promoted "
                             f"**{result['old_rank']}** → **{result['new_rank']}** "
-                            f"and transferred to **{detachment.name}** → **{subdivision.name}**\n"
-                            f"Points: EP {result['old_ep']}→{result['new_ep']} | "
-                            f"TP {result['old_tp']}→{result['new_tp']} | "
-                            f"MP {result['old_mp']}→{result['new_mp']}"
+                            f"and transferred to **{detachment.name}**"
                         )
                     else:
                         announce_msg = (
                             f"🔄 **{player.username}** ({player.lore_name}) transferred to "
-                            f"**{detachment.name}** → **{subdivision.name}** as **{rank.value}**\n"
-                            f"Points: EP {result['new_ep']} | "
-                            f"TP {result['new_tp']} | MP {result['new_mp']}"
+                            f"**{detachment.name}** as **{rank.value}**"
                         )
                     await announce_ch.send(announce_msg)
             except Exception:
