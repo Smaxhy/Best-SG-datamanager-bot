@@ -53,6 +53,7 @@ def _extract_text(message: discord.Message) -> str:
 async def run_scan(
     channel: discord.TextChannel,
     dm_user: discord.Member,
+    excluded_names: set[str] | None = None,
 ) -> ScanResult:
     """
     Scan *channel* for logs in the last SCAN_HOURS, update sheets,
@@ -92,6 +93,19 @@ async def run_scan(
             continue
         if parsed.lore_name and parsed.lore_name.strip().lower() in BLACKLISTED_LORE_NAMES:
             continue
+
+        # ── Exclude check (per-scan exclusion) ─────────────────
+        if excluded_names:
+            if parsed.username.strip().lower() in excluded_names:
+                result.flagged_messages.append(
+                    f"⏭️ **{parsed.username}** excluded from this scan."
+                )
+                continue
+            if parsed.lore_name and parsed.lore_name.strip().lower() in excluded_names:
+                result.flagged_messages.append(
+                    f"⏭️ **{parsed.lore_name}** excluded from this scan."
+                )
+                continue
 
         # ── Stat limit check ─────────────────────────────────────
         over_limit = []
