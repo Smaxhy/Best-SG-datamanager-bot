@@ -4,5 +4,6 @@ from models.data_manager import DataManagerStats
 from models.scan_history import ScanHistory
 from models.command_log import CommandLog
 from models.rank_lock import RankLock
+from models.training_ban import TrainingBan
 
-__all__ = ["Base", "ProcessedLog", "DataManagerStats", "ScanHistory", "CommandLog", "RankLock"]
+__all__ = ["Base", "ProcessedLog", "DataManagerStats", "ScanHistory", "CommandLog", "RankLock", "TrainingBan"]
