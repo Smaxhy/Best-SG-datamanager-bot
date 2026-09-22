@@ -14,14 +14,25 @@ from services import database_service as db
 from services import sheets_service as sheets
 
 
+STAFF_NCO_ROLES = {1475334068265685143, 1475334068265685146}
+
+
+def _has_staff_permission(interaction: discord.Interaction) -> bool:
+    """Staff/NCO only — for ranklock commands."""
+    if interaction.guild is None:
+        return False
+    role_ids = {r.id for r in interaction.user.roles}
+    return bool(role_ids & STAFF_NCO_ROLES)
+
+
 def _has_permission(interaction: discord.Interaction) -> bool:
+    """DM, Staff, or NCO — for /add command."""
     if interaction.guild is None:
         return False
     role_ids = {r.id for r in interaction.user.roles}
     return (
         config.DATA_MANAGER_ROLE_ID in role_ids
-        or config.STAFF_ROLE_ID in role_ids
-        or config.NCO_ROLE_ID in role_ids
+        or bool(role_ids & STAFF_NCO_ROLES)
     )
 
 
@@ -40,7 +51,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         reason: str | None = None,
         hours: int | None = None,
     ):
-        if not _has_permission(interaction):
+        if not _has_staff_permission(interaction):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
 
@@ -71,7 +82,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         interaction: discord.Interaction,
         username: str,
     ):
-        if not _has_permission(interaction):
+        if not _has_staff_permission(interaction):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
 
@@ -91,7 +102,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
     # ── /ranklocked — view all locked players ────────────────────
     @tree.command(name="ranklocked", description="View all rank-locked players")
     async def ranklocked_command(interaction: discord.Interaction):
-        if not _has_permission(interaction):
+        if not _has_staff_permission(interaction):
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
 
