@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import config
-from models import Base, ProcessedLog, DataManagerStats, ScanHistory, CommandLog, RankLock
+from models import Base, ProcessedLog, DataManagerStats, ScanHistory, CommandLog, RankLock, TrainingBan
 
 logger = logging.getLogger("bot.database")
 
@@ -387,3 +387,80 @@ async def get_all_ranklocks() -> list[RankLock]:
         stmt = select(RankLock).order_by(RankLock.locked_at.desc())
         result = await session.execute(stmt)
         return list(result.scalars().all())
+
+
+# ── Training ban functions ──────────────────────────────────────────
+
+async def trainingban_player(
+    username: str,
+    banned_by_id: int,
+    banned_by_name: str,
+    discord_id: int | None = None,
+    reason: str | None = None,
+    hours: int | None = None,
+) -> bool:
+    """Ban a player from training. Returns True if newly banned, False if already banned."""
+    async with async_session() as session:
+        stmt = select(TrainingBan).where(TrainingBan.username == username.lower())
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if existing:
+            return False
+        expires = datetime.now(timezone.utc) + timedelta(hours=hours) if hours else None
+        ban = TrainingBan(
+            username=username.lower(),
+            discord_id=discord_id,
+            banned_by_id=banned_by_id,
+            banned_by_name=banned_by_name,
+            reason=reason,
+            expires_at=expires,
+        )
+        session.add(ban)
+        await session.commit()
+        return True
+
+
+async def trainingunban_player(username: str) -> bool:
+    """Unban a player from training. Returns True if unbanned, False if wasn't banned."""
+    async with async_session() as session:
+        stmt = select(TrainingBan).where(TrainingBan.username == username.lower())
+        result = await session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if not existing:
+            return False
+        await session.delete(existing)
+        await session.commit()
+        return True
+
+
+async def is_trainingbanned(username: str) -> TrainingBan | None:
+    """Check if a player is training-banned. Auto-removes expired bans."""
+    async with async_session() as session:
+        stmt = select(TrainingBan).where(TrainingBan.username == username.lower())
+        result = await session.execute(stmt)
+        ban = result.scalar_one_or_none()
+        if ban is None:
+            return None
+        if ban.expires_at and datetime.now(timezone.utc) >= ban.expires_at:
+            await session.delete(ban)
+            await session.commit()
+            return None
+        return ban
+
+
+async def get_all_trainingbans() -> list[TrainingBan]:
+    """Get all active training bans."""
+    async with async_session() as session:
+        stmt = select(TrainingBan).order_by(TrainingBan.banned_at.desc())
+        result = await session.execute(stmt)
+        bans = list(result.scalars().all())
+        # Auto-clean expired
+        now = datetime.now(timezone.utc)
+        active = []
+        for ban in bans:
+            if ban.expires_at and now >= ban.expires_at:
+                await session.delete(ban)
+            else:
+                active.append(ban)
+        await session.commit()
+        return active
