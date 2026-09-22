@@ -145,18 +145,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         # Post notice in the training ban log channel
         log_channel = bot.get_channel(TRAINING_BAN_LOG_CHANNEL_ID)
         if log_channel:
-            log_embed = discord.Embed(
-                title="🚫 Training Ban",
-                colour=discord.Colour.red(),
-            )
-            log_embed.add_field(name="Player", value=f"{member.mention} ({username})", inline=False)
-            log_embed.add_field(name="Duration", value=duration_str, inline=True)
-            log_embed.add_field(name="Expires", value=expires_str, inline=True)
-            log_embed.add_field(name="Reason", value=reason, inline=False)
-            log_embed.add_field(name="Banned by", value=interaction.user.mention, inline=True)
-            log_embed.set_footer(text=f"Issued {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
             try:
-                await log_channel.send(embed=log_embed)
+                await log_channel.send(
+                    f"🚫 **{username}** ({member.mention}) training banned — "
+                    f"{duration_str} — expires {expires_str} — {reason}"
+                )
             except Exception:
                 logger.exception("Failed to post training ban notice")
 
