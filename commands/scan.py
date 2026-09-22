@@ -34,8 +34,15 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
     """Register the /scan command on the provided tree."""
 
     @tree.command(name="scan", description="Scan a channel for player activity logs")
-    @app_commands.describe(channel="The Discord channel to scan")
-    async def scan_command(interaction: discord.Interaction, channel: discord.TextChannel):
+    @app_commands.describe(
+        channel="The Discord channel to scan",
+        exclude="Usernames to skip this scan (comma-separated, e.g. Smaxhy,foot3331)",
+    )
+    async def scan_command(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        exclude: str | None = None,
+    ):
         # ── Permission check ─────────────────────────────────────
         if not has_required_role(interaction):
             await interaction.response.send_message(
@@ -69,8 +76,13 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             details=f"#{channel.name}", channel_name=interaction.channel.name,
         )
 
+        # Parse excluded usernames
+        excluded_names: set[str] = set()
+        if exclude:
+            excluded_names = {name.strip().lower() for name in exclude.split(",") if name.strip()}
+
         try:
-            result = await run_scan(channel, interaction.user)
+            result = await run_scan(channel, interaction.user, excluded_names=excluded_names)
         except Exception:
             logger.exception("Scan failed.")
             await interaction.followup.send("💥 Scan failed due to an internal error. Check the logs.")
