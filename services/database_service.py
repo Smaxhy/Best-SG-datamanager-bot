@@ -230,7 +230,7 @@ async def get_alltime_leaderboard() -> list[dict]:
                 func.sum(DataManagerStats.logs_processed).label("total_logs"),
                 func.sum(DataManagerStats.scans_completed).label("total_scans"),
             )
-            .group_by(DataManagerStats.discord_user_id)
+            .group_by(DataManagerStats.discord_user_id, DataManagerStats.discord_username)
             .order_by(func.sum(DataManagerStats.logs_processed).desc())
         )
         result = await session.execute(stmt)
@@ -239,8 +239,8 @@ async def get_alltime_leaderboard() -> list[dict]:
             {
                 "user_id": r.discord_user_id,
                 "username": r.discord_username,
-                "logs": r.total_logs,
-                "scans": r.total_scans,
+                "logs": r.total_logs or 0,
+                "scans": r.total_scans or 0,
             }
             for r in rows
         ]
