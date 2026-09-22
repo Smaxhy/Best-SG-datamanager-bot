@@ -159,6 +159,30 @@ async def run_scan(
                 pass
             continue
 
+        # ── Training ban check — also skip stat updates ──
+        tban = await db.is_trainingbanned(player.username)
+        if tban:
+            result.flagged_messages.append(
+                f"🚫 **{parsed.username}** is training banned"
+                + (f" ({tban.reason})" if tban.reason else "")
+                + " — EP/TP/MP skipped."
+            )
+            try:
+                await db.record_processed_log(
+                    message_id=message.id,
+                    channel_id=channel.id,
+                    dm_id=dm_user.id,
+                    dm_name=str(dm_user),
+                    username=parsed.username,
+                    lore_name=parsed.lore_name,
+                    ep=0, tp=0, mp=0,
+                    detachment=player.sheet_name,
+                    status="skipped_trainingban",
+                )
+            except Exception:
+                pass
+            continue
+
         # ── Lore name validation (accepts partial/first-name matches) ──
         if parsed.lore_name and player.lore_name:
             log_lore = parsed.lore_name.strip().lower()
