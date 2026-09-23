@@ -19,8 +19,8 @@ from services import sheets_service as sheets
 logger = logging.getLogger("bot.scan")
 
 # ── Blacklisted players (case-insensitive) ───────────────────────
-BLACKLISTED_USERNAMES = {"tripleaabatterynocap"}
-BLACKLISTED_LORE_NAMES = {"elias e."}
+BLACKLISTED_USERNAMES: set[str] = set()
+BLACKLISTED_LORE_NAMES: set[str] = set()
 
 # ── Max stats per log entry ──────────────────────────────────────
 MAX_STAT_PER_LOG = 5
