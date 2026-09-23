@@ -54,6 +54,7 @@ async def run_scan(
     channel: discord.TextChannel,
     dm_user: discord.Member,
     excluded_names: set[str] | None = None,
+    force: bool = False,
 ) -> ScanResult:
     """
     Scan *channel* for logs in the last SCAN_HOURS, update sheets,
@@ -87,6 +88,9 @@ async def run_scan(
         parsed = parse_log(full_text)
         if parsed is None:
             continue
+
+        logger.info("Parsed log: user='%s', lore='%s', EP=%d TP=%d MP=%d (msg %s)",
+                    parsed.username, parsed.lore_name, parsed.ep, parsed.tp, parsed.mp, message.id)
 
         # ── Blacklist check ──────────────────────────────────────
         if parsed.username.strip().lower() in BLACKLISTED_USERNAMES:
@@ -126,7 +130,7 @@ async def run_scan(
         result.valid_logs += 1
 
         # ── Duplicate check ──────────────────────────────────────
-        if await db.is_already_processed(message.id):
+        if not force and await db.is_already_processed(message.id):
             result.already_processed += 1
             continue
 
