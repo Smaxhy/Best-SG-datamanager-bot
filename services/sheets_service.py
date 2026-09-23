@@ -888,3 +888,85 @@ async def find_ancillary_player(username: str) -> PlayerRow | None:
                     return _build_player(row, headers, ws.title, row_idx)
 
     return None
+
+
+# ── Add player to any sheet ─────────────────────────────────────────
+
+async def add_player_to_sheet(
+    username: str,
+    lore_name: str,
+    sheet_name: str,
+    subdivision: str | None = None,
+) -> str:
+    """
+    Add a new player to a sheet. For Rook/Bastion, subdivision is required.
+    For other sheets (Ancillary, Medical, etc.), finds the first section with
+    a USERNAME column that has stat columns and inserts there.
+
+    Returns a success message string.
+    """
+    ws = await _get_worksheet_safe(sheet_name)
+    if ws is None:
+        raise RuntimeError(f"Cannot find sheet '{sheet_name}'")
+
+    all_values = await ws.get_all_values()
+    sections = _find_table_sections(all_values)
+
+    if not sections:
+        raise RuntimeError(f"No data sections found in '{sheet_name}'")
+
+    # If subdivision is given (Rook/Bastion), use the existing function
+    if subdivision and sheet_name in SUBDIVISION_MAP:
+        result = await find_empty_row_in_section(sheet_name, subdivision)
+        if result is None:
+            raise RuntimeError(f"No empty row in {sheet_name} → {subdivision}")
+        dest_row, headers = result
+    else:
+        # Find the first section with EP columns and an empty row
+        dest_row = None
+        headers = None
+        for section in sections:
+            if "EP" not in section["headers"]:
+                continue  # skip command sections
+            header_row = section["header_row"]
+            username_col = section["username_col"]
+            h = section["headers"]
+            for row_idx in range(header_row + 1, len(all_values)):
+                row = all_values[row_idx]
+                if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                    break
+                cell_val = row[username_col].strip() if username_col < len(row) else ""
+                if not cell_val:
+                    dest_row = row_idx + 1
+                    headers = h
+                    break
+            if dest_row:
+                break
+
+        if dest_row is None or headers is None:
+            raise RuntimeError(f"No empty row found in '{sheet_name}'")
+
+    # Write the player
+    updates = []
+    for key, value in [
+        ("USERNAME", username),
+        ("LORE NAME", lore_name),
+        ("RANK", "RCT"),
+        ("EP", "0"),
+        ("TP", "0"),
+        ("MP", "0"),
+    ]:
+        col = headers.get(key)
+        if col is not None:
+            updates.append(gspread.Cell(row=dest_row, col=col + 1, value=value))
+
+    if updates:
+        await ws.update_cells(updates, value_input_option="RAW")
+
+    location = f"{sheet_name} → {subdivision}" if subdivision else sheet_name
+    logger.info("Added player %s (%s) to %s row %d", username, lore_name, location, dest_row)
+
+    return (
+        f"**{username}** ({lore_name}) added to **{location}** as **RCT** "
+        f"(row {dest_row})"
+    )
