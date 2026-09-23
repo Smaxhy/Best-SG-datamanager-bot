@@ -37,11 +37,13 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
     @app_commands.describe(
         channel="The Discord channel to scan",
         exclude="Usernames to skip this scan (comma-separated, e.g. Smaxhy,foot3331)",
+        force="Force rescan — ignore already-processed messages",
     )
     async def scan_command(
         interaction: discord.Interaction,
         channel: discord.TextChannel,
         exclude: str | None = None,
+        force: bool = False,
     ):
         # ── Permission check ─────────────────────────────────────
         if not has_required_role(interaction):
@@ -82,7 +84,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             excluded_names = {name.strip().lower() for name in exclude.split(",") if name.strip()}
 
         try:
-            result = await run_scan(channel, interaction.user, excluded_names=excluded_names)
+            result = await run_scan(channel, interaction.user, excluded_names=excluded_names, force=force)
         except Exception:
             logger.exception("Scan failed.")
             await interaction.followup.send("💥 Scan failed due to an internal error. Check the logs.")
