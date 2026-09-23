@@ -94,22 +94,30 @@ async def run_scan(
 
         # ── Blacklist check ──────────────────────────────────────
         if parsed.username.strip().lower() in BLACKLISTED_USERNAMES:
+            logger.info("  BLOCKED by username blacklist: '%s'", parsed.username)
             continue
         if parsed.lore_name and parsed.lore_name.strip().lower() in BLACKLISTED_LORE_NAMES:
+            logger.info("  BLOCKED by lore blacklist: '%s'", parsed.lore_name)
             continue
+
+        logger.info("  Passed blacklist check")
 
         # ── Exclude check (per-scan exclusion) ─────────────────
         if excluded_names:
             if parsed.username.strip().lower() in excluded_names:
+                logger.info("  EXCLUDED by username: '%s'", parsed.username)
                 result.flagged_messages.append(
                     f"⏭️ **{parsed.username}** excluded from this scan."
                 )
                 continue
             if parsed.lore_name and parsed.lore_name.strip().lower() in excluded_names:
+                logger.info("  EXCLUDED by lore: '%s'", parsed.lore_name)
                 result.flagged_messages.append(
                     f"⏭️ **{parsed.lore_name}** excluded from this scan."
                 )
                 continue
+
+        logger.info("  Passed exclude check")
 
         # ── Stat limit check ─────────────────────────────────────
         over_limit = []
@@ -125,8 +133,10 @@ async def run_scan(
                 f"🚫 **{parsed.username}** — Rejected: {', '.join(over_limit)} exceeds "
                 f"the max of {MAX_STAT_PER_LOG} per log. Please alert an NCO."
             )
+            logger.info("  BLOCKED by stat limit: %s", over_limit)
             continue
 
+        logger.info("  Passed all checks — counting as valid log")
         result.valid_logs += 1
 
         # ── Duplicate check ──────────────────────────────────────
