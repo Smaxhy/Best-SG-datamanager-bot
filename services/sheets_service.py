@@ -189,16 +189,29 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
                         # If lore also matches, best possible result
                         if target_lore and cell_lore_low == target_lore:
                             logger.info("  EXACT user+lore: '%s' / '%s' row %d", cell_user, cell_lore, row_idx+1)
-                            return p
+                            # Prefer match with stat columns
+                            if p.col_ep >= 0:
+                                return p
+                            if exact_user is None:
+                                exact_user = p
                         if exact_user is None:
                             exact_user = p
                             logger.info("  Username match: '%s' row %d, lore='%s'", cell_user, row_idx+1, cell_lore)
+                        elif p.col_ep >= 0 and exact_user.col_ep < 0:
+                            # Upgrade to a match that has stat columns
+                            exact_user = p
+                            logger.info("  Upgraded username match to section with stats: '%s' row %d", cell_user, row_idx+1)
 
                     # 2. Full lore name matches what was typed as "username"
                     elif cell_lore_low and cell_lore_low == target:
                         if exact_lore_as_user is None:
                             exact_lore_as_user = _build_player(row, headers, ws.title, row_idx)
                             logger.info("  Lore-as-username: '%s' -> user '%s' row %d", target, cell_user, row_idx+1)
+                        else:
+                            p = _build_player(row, headers, ws.title, row_idx)
+                            if p.col_ep >= 0 and exact_lore_as_user.col_ep < 0:
+                                exact_lore_as_user = p
+                                logger.info("  Upgraded lore match to section with stats: '%s' row %d", target, row_idx+1)
 
                     # 3. First name of lore matches
                     elif cell_lore_low:
@@ -207,6 +220,10 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
                             if first_name is None:
                                 first_name = _build_player(row, headers, ws.title, row_idx)
                                 logger.info("  First-name: '%s' -> '%s' (%s) row %d", target, cell_user, cell_lore, row_idx+1)
+                            else:
+                                p = _build_player(row, headers, ws.title, row_idx)
+                                if p.col_ep >= 0 and first_name.col_ep < 0:
+                                    first_name = p
 
         except Exception:
             logger.exception("Error searching sheet '%s'.", sheet_name)
@@ -242,6 +259,13 @@ async def update_player_stats(
         await ws.update_cells(updates, value_input_option="RAW")
         logger.info("Updated %s in [%s] row %d: EP %+d, TP %+d, MP %+d",
                     player.username, player.sheet_name, player.row_index, ep_delta, tp_delta, mp_delta)
+    else:
+        logger.warning("No stat columns for %s in [%s] row %d — EP/TP/MP not updated!",
+                       player.username, player.sheet_name, player.row_index)
+        raise RuntimeError(
+            f"**{player.username}** found in **{player.sheet_name}** row {player.row_index} "
+            f"but that section has no EP/TP/MP columns — points not added."
+        )
 
 
 # ── Promotion helpers ────────────────────────────────────────────────
