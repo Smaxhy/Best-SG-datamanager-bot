@@ -4,6 +4,7 @@
 Usage:
     /addlog username:Smaxhy lorename:Jessica Cruz sheet:Ancillary
     /addlog username:Smaxhy lorename:Jessica Cruz sheet:Rook subdivision:Charlie
+    /addlog username:Smaxhy lorename:Jessica Cruz sheet:Device Wielders device_status:Active sourced_by:NCO
 """
 
 from __future__ import annotations
@@ -34,7 +35,9 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         username="The player's in-game username",
         lorename="The player's lore name (first and last)",
         sheet="Which sheet to add them to",
-        subdivision="(Rook/Bastion only) Which subdivision",
+        subdivision="(Rook/Bastion/Valkyrie only) Which subdivision",
+        device_status="(Device Wielders only) Device status",
+        sourced_by="(Device Wielders only) Who sourced the device",
     )
     @app_commands.choices(sheet=[
         app_commands.Choice(name="Ancillary", value="[C] ANCILLARY"),
@@ -55,12 +58,20 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         app_commands.Choice(name="Aether (Valkyrie)", value="Aether"),
         app_commands.Choice(name="Helios (Valkyrie)", value="Helios"),
     ])
+    @app_commands.choices(device_status=[
+        app_commands.Choice(name="Active", value="Active"),
+        app_commands.Choice(name="Inactive", value="Inactive"),
+        app_commands.Choice(name="Pending", value="Pending"),
+        app_commands.Choice(name="Revoked", value="Revoked"),
+    ])
     async def addlog_command(
         interaction: discord.Interaction,
         username: str,
         lorename: str,
         sheet: app_commands.Choice[str],
         subdivision: app_commands.Choice[str] | None = None,
+        device_status: app_commands.Choice[str] | None = None,
+        sourced_by: str | None = None,
     ):
         if not _has_permission(interaction):
             await interaction.response.send_message(
@@ -68,6 +79,8 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 ephemeral=True,
             )
             return
+
+        is_device = sheet.value == "DEVICE WIELDERS"
 
         # Rook/Bastion/Valkyrie require a subdivision
         needs_sub = sheet.value in ("[D] ROOK", "[D] BASTION", "[U] VALKYRIE")
@@ -104,14 +117,23 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         await interaction.response.defer()
 
-        # Check if player already exists somewhere
+        # Duplicate check — only block if they already exist in the SAME sheet
+        # (a player CAN be in Bastion AND Device Wielders simultaneously)
         existing = await sheets.find_player(username)
-        if existing:
+        if existing and existing.sheet_name.strip().upper() == sheet.value.strip().upper():
             await interaction.followup.send(
                 f"⚠️ **{username}** already exists in **{existing.sheet_name}** "
-                f"(row {existing.row_index}). Use /promote to transfer them instead."
+                f"(row {existing.row_index})."
             )
             return
+
+        # Build extra fields for Device Wielders
+        extra_fields = {}
+        if is_device:
+            if device_status:
+                extra_fields["DEVICE STATUS"] = device_status.value
+            if sourced_by:
+                extra_fields["SOURCED BY"] = sourced_by
 
         try:
             result_msg = await sheets.add_player_to_sheet(
@@ -119,6 +141,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 lore_name=lorename,
                 sheet_name=sheet.value,
                 subdivision=subdivision.value if subdivision else None,
+                extra_fields=extra_fields,
             )
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to add player: {exc}")
