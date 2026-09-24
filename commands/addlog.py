@@ -36,6 +36,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         lorename="The player's lore name (first and last)",
         sheet="Which sheet to add them to",
         subdivision="(Rook/Bastion/Valkyrie only) Which subdivision",
+        rank="Rank to assign (default RCT)",
         device_status="(Device Wielders only) Device status",
         sourced_by="(Device Wielders only) Who sourced the device",
     )
@@ -64,12 +65,19 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         app_commands.Choice(name="Pending", value="Pending"),
         app_commands.Choice(name="Revoked", value="Revoked"),
     ])
+    @app_commands.choices(rank=[
+        app_commands.Choice(name="RCT", value="RCT"),
+        app_commands.Choice(name="PVT", value="PVT"),
+        app_commands.Choice(name="PFC", value="PFC"),
+        app_commands.Choice(name="LCPL", value="LCPL"),
+    ])
     async def addlog_command(
         interaction: discord.Interaction,
         username: str,
         lorename: str,
         sheet: app_commands.Choice[str],
         subdivision: app_commands.Choice[str] | None = None,
+        rank: app_commands.Choice[str] | None = None,
         device_status: app_commands.Choice[str] | None = None,
         sourced_by: str | None = None,
     ):
@@ -141,6 +149,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 lore_name=lorename,
                 sheet_name=sheet.value,
                 subdivision=subdivision.value if subdivision else None,
+                rank=rank.value if rank else "RCT",
                 extra_fields=extra_fields,
             )
         except Exception as exc:
