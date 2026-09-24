@@ -81,8 +81,10 @@ class DataManagerBot(discord.Client):
         if message.author == self.user:
             return
 
-        # Auto-reply when someone pings Miyabi (621085757897179142)
+        # Auto-reply when someone DIRECTLY pings Miyabi (not replies)
         MIYABI_ID = 621085757897179142
+        if message.reference is not None:
+            return  # skip replies
         mentioned = any(m.id == MIYABI_ID for m in message.mentions)
         if not mentioned:
             mentioned = f"<@{MIYABI_ID}>" in message.content or f"<@!{MIYABI_ID}>" in message.content
