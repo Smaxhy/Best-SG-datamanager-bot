@@ -76,6 +76,25 @@ class DataManagerBot(discord.Client):
             logger.info("Cleared guild commands for %s", guild.name)
         logger.info("Bot is online as %s (ID: %s)", self.user, self.user.id)
 
+    async def on_message(self, message: discord.Message) -> None:
+        # Ignore bot's own messages
+        if message.author == self.user:
+            return
+
+        # Auto-reply when someone pings Miyabi (621085757897179142)
+        MIYABI_ID = 621085757897179142
+        mentioned = any(m.id == MIYABI_ID for m in message.mentions)
+        if not mentioned:
+            mentioned = f"<@{MIYABI_ID}>" in message.content or f"<@!{MIYABI_ID}>" in message.content
+        if mentioned:
+            await message.reply(
+                "*Miyabi Cruz, known within the walls as the recruit finger cutter. "
+                "Recruits fear her as she is upmost evil.*\n"
+                "https://cdn.discordapp.com/attachments/1329925898094514176/1552814006538993826/"
+                "image_2026-09-24_174804547.gif?ex=6ab6fa3d&is=6ab5a8bd&"
+                "hm=920e09d8d07ffde8b897fb9ec32482624fe164c2f5902f006f6d4e4575e47779&"
+            )
+
 
 def main() -> None:
     if not config.DISCORD_TOKEN:
