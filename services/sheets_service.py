@@ -907,6 +907,7 @@ async def add_player_to_sheet(
     lore_name: str,
     sheet_name: str,
     subdivision: str | None = None,
+    rank: str = "RCT",
     extra_fields: dict | None = None,
 ) -> str:
     """
@@ -933,15 +934,17 @@ async def add_player_to_sheet(
             raise RuntimeError(f"No empty row in {sheet_name} → {subdivision}")
         dest_row, headers = result
     else:
-        # Find the first section with EP columns and an empty row
+        # Find the first section with data columns (EP or DEVICE STATUS) and an empty row
+        # Skip bare command sections (only USERNAME/RANK/LORE NAME)
         dest_row = None
         headers = None
         for section in sections:
-            if "EP" not in section["headers"]:
-                continue  # skip command sections
+            h = section["headers"]
+            has_data_cols = "EP" in h or "DEVICE STATUS" in h
+            if not has_data_cols and len(h) <= 3:
+                continue  # skip bare command sections
             header_row = section["header_row"]
             username_col = section["username_col"]
-            h = section["headers"]
             for row_idx in range(header_row + 1, len(all_values)):
                 row = all_values[row_idx]
                 if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
@@ -965,7 +968,7 @@ async def add_player_to_sheet(
 
     # Only add RANK if the section has it
     if "RANK" in headers:
-        fields.append(("RANK", "RCT"))
+        fields.append(("RANK", rank.strip().upper()))
 
     # Stat columns (Rook/Bastion/Ancillary)
     for stat in ("EP", "TP", "MP"):
@@ -991,6 +994,6 @@ async def add_player_to_sheet(
     logger.info("Added player %s (%s) to %s row %d", username, lore_name, location, dest_row)
 
     return (
-        f"**{username}** ({lore_name}) added to **{location}** as **RCT** "
+        f"**{username}** ({lore_name}) added to **{location}** as **{rank.strip().upper()}** "
         f"(row {dest_row})"
     )
