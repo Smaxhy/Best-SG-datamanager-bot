@@ -40,17 +40,20 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         app_commands.Choice(name="Ancillary", value="[C] ANCILLARY"),
         app_commands.Choice(name="Rook", value="[D] ROOK"),
         app_commands.Choice(name="Bastion", value="[D] BASTION"),
+        app_commands.Choice(name="Valkyrie", value="[U] VALKYRIE"),
         app_commands.Choice(name="Medical", value="[U] MEDICAL"),
         app_commands.Choice(name="Research", value="[U] RESEARCH"),
         app_commands.Choice(name="Cannoneer", value="[U] CANNONEER"),
-        app_commands.Choice(name="Valkyrie", value="[U] VALKYRIE"),
         app_commands.Choice(name="Peacekeeper", value="[S] PEACEKEEPER"),
+        app_commands.Choice(name="Device Wielders", value="DEVICE WIELDERS"),
     ])
     @app_commands.choices(subdivision=[
         app_commands.Choice(name="Charlie (Rook left)", value="Charlie"),
         app_commands.Choice(name="Delta (Rook right)", value="Delta"),
         app_commands.Choice(name="Alpha (Bastion left)", value="Alpha"),
         app_commands.Choice(name="Bravo (Bastion right)", value="Bravo"),
+        app_commands.Choice(name="Aether (Valkyrie)", value="Aether"),
+        app_commands.Choice(name="Helios (Valkyrie)", value="Helios"),
     ])
     async def addlog_command(
         interaction: discord.Interaction,
@@ -66,11 +69,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             )
             return
 
-        # Rook/Bastion require a subdivision
-        needs_sub = sheet.value in ("[D] ROOK", "[D] BASTION")
+        # Rook/Bastion/Valkyrie require a subdivision
+        needs_sub = sheet.value in ("[D] ROOK", "[D] BASTION", "[U] VALKYRIE")
         if needs_sub and subdivision is None:
             await interaction.response.send_message(
-                f"❌ **{sheet.name}** requires a subdivision (Charlie/Delta or Alpha/Bravo).",
+                f"❌ **{sheet.name}** requires a subdivision.",
                 ephemeral=True,
             )
             return
@@ -79,6 +82,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         if subdivision:
             rook_subs = ("Charlie", "Delta")
             bastion_subs = ("Alpha", "Bravo")
+            valkyrie_subs = ("Aether", "Helios")
             if sheet.value == "[D] ROOK" and subdivision.value not in rook_subs:
                 await interaction.response.send_message(
                     f"❌ Rook only has Charlie or Delta, not {subdivision.name}.",
@@ -88,6 +92,12 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             if sheet.value == "[D] BASTION" and subdivision.value not in bastion_subs:
                 await interaction.response.send_message(
                     f"❌ Bastion only has Alpha or Bravo, not {subdivision.name}.",
+                    ephemeral=True,
+                )
+                return
+            if sheet.value == "[U] VALKYRIE" and subdivision.value not in valkyrie_subs:
+                await interaction.response.send_message(
+                    f"❌ Valkyrie only has Aether or Helios, not {subdivision.name}.",
                     ephemeral=True,
                 )
                 return
