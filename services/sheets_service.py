@@ -91,6 +91,12 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
                     headers["EXAM"] = c
                 elif v == "SCOUTED" and "SCOUTED" not in headers:
                     headers["SCOUTED"] = c
+                elif v == "DEVICE STATUS" and "DEVICE STATUS" not in headers:
+                    headers["DEVICE STATUS"] = c
+                elif v == "LAST INSPECTED" and "LAST INSPECTED" not in headers:
+                    headers["LAST INSPECTED"] = c
+                elif v == "SOURCED BY" and "SOURCED BY" not in headers:
+                    headers["SOURCED BY"] = c
             sections.append({
                 "header_row": row_idx,
                 "username_col": ucol,
@@ -282,6 +288,10 @@ SUBDIVISION_MAP = {
     "[D] BASTION": {
         "Alpha": 6,
         "Bravo": 15,
+    },
+    "[U] VALKYRIE": {
+        "Aether": 6,
+        "Helios": 15,
     },
 }
 
@@ -946,16 +956,31 @@ async def add_player_to_sheet(
         if dest_row is None or headers is None:
             raise RuntimeError(f"No empty row found in '{sheet_name}'")
 
-    # Write the player
-    updates = []
-    for key, value in [
+    # Write the player — build fields based on what the section has
+    fields = [
         ("USERNAME", username),
         ("LORE NAME", lore_name),
-        ("RANK", "RCT"),
-        ("EP", "0"),
-        ("TP", "0"),
-        ("MP", "0"),
-    ]:
+    ]
+
+    # Only add RANK if the section has it
+    if "RANK" in headers:
+        fields.append(("RANK", "RCT"))
+
+    # Stat columns (Rook/Bastion/Ancillary)
+    for stat in ("EP", "TP", "MP"):
+        if stat in headers:
+            fields.append((stat, "0"))
+
+    # Device Wielder columns — set defaults
+    if "DEVICE STATUS" in headers:
+        fields.append(("DEVICE STATUS", ""))
+    if "LAST INSPECTED" in headers:
+        fields.append(("LAST INSPECTED", ""))
+    if "SOURCED BY" in headers:
+        fields.append(("SOURCED BY", ""))
+
+    updates = []
+    for key, value in fields:
         col = headers.get(key)
         if col is not None:
             updates.append(gspread.Cell(row=dest_row, col=col + 1, value=value))
