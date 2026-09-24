@@ -907,6 +907,7 @@ async def add_player_to_sheet(
     lore_name: str,
     sheet_name: str,
     subdivision: str | None = None,
+    extra_fields: dict | None = None,
 ) -> str:
     """
     Add a new player to a sheet. For Rook/Bastion, subdivision is required.
@@ -971,13 +972,11 @@ async def add_player_to_sheet(
         if stat in headers:
             fields.append((stat, "0"))
 
-    # Device Wielder columns — set defaults
-    if "DEVICE STATUS" in headers:
-        fields.append(("DEVICE STATUS", ""))
-    if "LAST INSPECTED" in headers:
-        fields.append(("LAST INSPECTED", ""))
-    if "SOURCED BY" in headers:
-        fields.append(("SOURCED BY", ""))
+    # Apply any extra fields passed from the command (e.g. Device Wielder fields)
+    if extra_fields:
+        for key, value in extra_fields.items():
+            if key in headers:
+                fields.append((key, value))
 
     updates = []
     for key, value in fields:
