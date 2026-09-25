@@ -96,6 +96,19 @@ class DataManagerBot(discord.Client):
                 "image_2026-09-24_174804547.gif?ex=6ab6fa3d&is=6ab5a8bd&"
                 "hm=920e09d8d07ffde8b897fb9ec32482624fe164c2f5902f006f6d4e4575e47779&"
             )
+            return
+
+        # Auto-reply when someone DIRECTLY pings user 781794464023969812
+        SMAXHY_ID = 781794464023969812
+        mentioned2 = any(m.id == SMAXHY_ID for m in message.mentions)
+        if not mentioned2:
+            mentioned2 = f"<@{SMAXHY_ID}>" in message.content or f"<@!{SMAXHY_ID}>" in message.content
+        if mentioned2:
+            await message.reply(
+                "https://cdn.discordapp.com/attachments/1549886191501840514/1552812092489211924/"
+                "image_2026-09-24_174030285.gif?ex=6ab7a134&is=6ab64fb4&"
+                "hm=bb2ac8b93b98072267a264be9cb0da594368ee53b16184fa0398a03dc32d1cd3&"
+            )
 
 
 def main() -> None:
