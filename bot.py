@@ -77,18 +77,18 @@ class DataManagerBot(discord.Client):
         logger.info("Bot is online as %s (ID: %s)", self.user, self.user.id)
 
     async def on_message(self, message: discord.Message) -> None:
-        # Ignore bot's own messages
-        if message.author == self.user:
+        # Ignore bots and replies
+        if message.author.bot:
+            return
+        if message.reference is not None:
             return
 
-        # Auto-reply when someone DIRECTLY pings Miyabi (not replies)
+        content = message.content
+        mention_ids = {m.id for m in message.mentions}
+
+        # Auto-reply when someone DIRECTLY pings Miyabi
         MIYABI_ID = 621085757897179142
-        if message.reference is not None:
-            return  # skip replies
-        mentioned = any(m.id == MIYABI_ID for m in message.mentions)
-        if not mentioned:
-            mentioned = f"<@{MIYABI_ID}>" in message.content or f"<@!{MIYABI_ID}>" in message.content
-        if mentioned:
+        if MIYABI_ID in mention_ids or f"<@{MIYABI_ID}>" in content:
             await message.reply(
                 "*Miyabi Cruz, known within the walls as the recruit finger cutter. "
                 "Recruits fear her as she is upmost evil.*\n"
@@ -98,17 +98,15 @@ class DataManagerBot(discord.Client):
             )
             return
 
-        # Auto-reply when someone DIRECTLY pings user 781794464023969812
+        # Auto-reply when someone DIRECTLY pings 781794464023969812
         SMAXHY_ID = 781794464023969812
-        mentioned2 = any(m.id == SMAXHY_ID for m in message.mentions)
-        if not mentioned2:
-            mentioned2 = f"<@{SMAXHY_ID}>" in message.content or f"<@!{SMAXHY_ID}>" in message.content
-        if mentioned2:
+        if SMAXHY_ID in mention_ids or f"<@{SMAXHY_ID}>" in content:
             await message.reply(
                 "https://cdn.discordapp.com/attachments/1549886191501840514/1552812092489211924/"
                 "image_2026-09-24_174030285.gif?ex=6ab7a134&is=6ab64fb4&"
                 "hm=bb2ac8b93b98072267a264be9cb0da594368ee53b16184fa0398a03dc32d1cd3&"
             )
+            return
 
 
 def main() -> None:
