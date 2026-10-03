@@ -16,8 +16,8 @@ Format B (unlabelled — first line is username, second is lore name):
     EP: 2
     TP: 1
 
-EP and TP are capped at 5 per log entry.
-MP is capped at 5 per log entry.
+Values are returned as written. Logs with any stat above 5 (or below -5)
+are rejected by the scan, not clamped here.
 """
 
 from __future__ import annotations
