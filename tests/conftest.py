@@ -7,6 +7,7 @@ import sys
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 import pytest_asyncio
 
 from models.base import Base
@@ -22,3 +23,12 @@ async def fresh_db():
     yield
     async with db.engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sheet_lock(monkeypatch):
+    """asyncio locks bind to one event loop; each test runs on its own."""
+    import asyncio
+    from services import sheets_service
+
+    monkeypatch.setattr(sheets_service, "_write_lock", asyncio.Lock())

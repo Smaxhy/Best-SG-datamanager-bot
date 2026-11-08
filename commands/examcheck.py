@@ -158,6 +158,8 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         passed_players = []
         check_errors = []
+        # Read the Ancillary sheet once for all the name lookups below
+        cache = sheets.SheetCache()
 
         for mid, entry in passed.items():
             nickname = entry["nickname"]
@@ -171,19 +173,19 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
             # Try each part of the nickname (username is usually after |)
             for part in reversed(parts):
-                player = await sheets.find_ancillary_player(part)
+                player = await sheets.find_ancillary_player(part, cache=cache)
                 if player:
                     break
 
             # If still not found, try the full nickname as-is
             if player is None:
-                player = await sheets.find_ancillary_player(nickname)
+                player = await sheets.find_ancillary_player(nickname, cache=cache)
 
             # Last resort: try first word of each part
             if player is None:
                 for part in parts:
                     first_word = part.split()[0] if " " in part else part
-                    player = await sheets.find_ancillary_player(first_word)
+                    player = await sheets.find_ancillary_player(first_word, cache=cache)
                     if player:
                         break
 

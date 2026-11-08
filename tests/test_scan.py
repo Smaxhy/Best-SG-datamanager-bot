@@ -29,20 +29,36 @@ class FakeSheets:
     def __init__(self, monkeypatch, players=()):
         self.players = {p.username.lower(): p for p in players}
         self.updates: list[tuple] = []
+        self.batches: list[int] = []
         self.find_error: Exception | None = None
         self.update_error: Exception | None = None
-        monkeypatch.setattr(sheets, "find_player", self.find_player)
-        monkeypatch.setattr(sheets, "update_player_stats", self.update_player_stats)
+        self.preload_errors: dict[str, Exception] = {}
+        fake = self
 
-    async def find_player(self, username, lore_name=None):
+        class FakeCache:
+            async def preload(self):
+                return dict(fake.preload_errors)
+
+        monkeypatch.setattr(sheets, "SheetCache", FakeCache)
+        monkeypatch.setattr(sheets, "find_player", self.find_player)
+        monkeypatch.setattr(sheets, "apply_stat_changes", self.apply_stat_changes)
+
+    async def find_player(self, username, lore_name=None, cache=None):
+        assert cache is not None, "run_scan should share one SheetCache across lookups"
         if self.find_error:
             raise self.find_error
         return self.players.get(username.strip().lower())
 
-    async def update_player_stats(self, player, *, ep_delta, tp_delta, mp_delta):
-        if self.update_error:
-            raise self.update_error
-        self.updates.append((player.username, ep_delta, tp_delta, mp_delta))
+    async def apply_stat_changes(self, changes):
+        self.batches.append(len(changes))
+        results = []
+        for player, ep, tp, mp in changes:
+            if self.update_error:
+                results.append(self.update_error)
+                continue
+            self.updates.append((player.username, ep, tp, mp))
+            results.append(None)
+        return results
 
 
 async def _processed_rows() -> list[ProcessedLog]:
@@ -106,6 +122,24 @@ async def test_log_posted_as_embed_is_processed(monkeypatch):
     fake = FakeSheets(monkeypatch, [_row()])
     await _run([message(1, "", embeds=[embed(LOG)])])
     assert fake.updates == [("Bob", 2, 1, 0)]
+
+
+async def test_all_sheet_updates_are_written_in_one_batch(monkeypatch):
+    fake = FakeSheets(monkeypatch, [_row(), _row("Al", "Al Smith")])
+    await _run([message(1, LOG), message(2, "gg"), message(3, "Username: Al\nEP: 1"), message(4, LOG)])
+    assert fake.batches == [3]
+    assert fake.updates == [("Bob", 2, 1, 0), ("Al", 1, 0, 0), ("Bob", 2, 1, 0)]
+
+
+async def test_unreadable_sheet_is_flagged_once(monkeypatch):
+    fake = FakeSheets(monkeypatch)
+    fake.preload_errors = {"[D] ROOK": RuntimeError("quota exceeded")}
+    result = await _run([message(1, LOG), message(2, LOG)])
+    assert result.errors == 1
+    assert result.flagged_messages[0] == (
+        "⚠️ Could not read sheet **[D] ROOK**: quota exceeded — players on it will show as not found."
+    )
+    assert result.players_not_found == 2
 
 
 async def test_players_updated_counts_unique_players(monkeypatch):
@@ -197,6 +231,7 @@ async def test_sheet_update_error_does_not_record_message(monkeypatch):
     fake.update_error = RuntimeError("no stat columns")
     result = await _run([message(1, LOG)])
     assert result.errors == 1 and result.new_processed == 0
+    assert result.flagged_messages == ["⚠️ Sheet update failed for **Bob**: no stat columns"]
     assert await db.is_already_processed(1) is False
     assert await db.get_dm_current_week(42) is not None  # scan still counted
 

@@ -1,5 +1,7 @@
 """Tests for sheets_service — table detection, player lookup, and sheet writes (against fake worksheets)."""
 
+import asyncio
+
 import pytest
 
 from models.player import PlayerRow
@@ -224,8 +226,11 @@ async def test_update_player_stats_writes_new_totals(monkeypatch):
 
 
 async def test_update_player_stats_without_stat_columns_raises(monkeypatch):
-    install_sheets(monkeypatch, rook_sheet())
-    p = _player(col_ep=-1, col_tp=-1, col_mp=-1)
+    values = grid(4, 6)
+    put_section(values, 0, 0, ["RANK", "USERNAME", "LORE NAME"], [["PVT", "Bob", "Bob J"]])
+    install_sheets(monkeypatch, FakeWorksheet("[D] ROOK", values))
+    p = await sheets.find_player("Bob")
+    assert p.col_ep == -1
     with pytest.raises(RuntimeError, match="no EP/TP/MP columns"):
         await sheets.update_player_stats(p, ep_delta=1, tp_delta=0, mp_delta=0)
 
@@ -419,3 +424,252 @@ async def test_add_player_skips_bare_sections_and_applies_extra_fields(monkeypat
     assert [ws.cell(1, c) for c in range(4, 8)] == ["New", "New Guy", "Active", ""]
     # The bare RANK/USERNAME/LORE NAME section is skipped
     assert ws.cell(1, 1) == "Boss" and ws.cell(2, 1) == ""
+
+
+# ── Fresh reads, batching and locking ────────────────────────────────
+
+async def test_stat_update_uses_current_sheet_values_not_stale_lookup(monkeypatch):
+    ws = rook_sheet(charlie=[["PVT", "Bob", "Bob J", "3", "1", "0"]])
+    install_sheets(monkeypatch, ws)
+    bob = await sheets.find_player("Bob")
+    ws.values[2][8] = "10"  # someone edits the sheet after the lookup
+    await sheets.update_player_stats(bob, ep_delta=2, tp_delta=0, mp_delta=0)
+    assert ws.cell(2, 8) == "12"
+
+
+async def test_stat_update_follows_player_after_resort(monkeypatch):
+    ws = rook_sheet(charlie=[
+        ["PVT", "Bob", "Bob J", "3", "0", "0"],
+        ["PVT", "Al", "Al A", "7", "0", "0"],
+    ])
+    install_sheets(monkeypatch, ws)
+    bob = await sheets.find_player("Bob")
+    ws.values[2], ws.values[3] = ws.values[3], ws.values[2]  # section re-sorted
+    await sheets.update_player_stats(bob, ep_delta=1, tp_delta=0, mp_delta=0)
+    assert (ws.cell(2, 6), ws.cell(2, 8)) == ("Al", "7")
+    assert (ws.cell(3, 6), ws.cell(3, 8)) == ("Bob", "4")
+
+
+async def test_stat_update_for_removed_player_fails_cleanly(monkeypatch):
+    ws = rook_sheet(charlie=[["PVT", "Bob", "Bob J", "3", "0", "0"]])
+    install_sheets(monkeypatch, ws)
+    bob = await sheets.find_player("Bob")
+    ws.values[2][6] = ""
+    with pytest.raises(RuntimeError, match="no longer in"):
+        await sheets.update_player_stats(bob, ep_delta=1, tp_delta=0, mp_delta=0)
+    assert ws.update_calls == []
+
+
+async def test_apply_stat_changes_batches_per_tab(monkeypatch):
+    rook = rook_sheet(charlie=[["PVT", "Bob", "", "3", "1", "0"], ["PVT", "Al", "", "0", "0", "0"]])
+    bastion = bastion_sheet(alpha=[["PVT", "Cy", "", "5", "0", "0"]])
+    install_sheets(monkeypatch, rook, bastion)
+    cache = sheets.SheetCache()
+    bob = await sheets.find_player("Bob", cache=cache)
+    al = await sheets.find_player("Al", cache=cache)
+    cy = await sheets.find_player("Cy", cache=cache)
+    reads_before = rook.reads + bastion.reads
+    results = await sheets.apply_stat_changes([
+        (bob, 2, 0, 0), (al, 1, 1, 1), (cy, -1, 0, 0), (bob, 1, 2, 0),
+    ])
+    assert results == [None, None, None, None]
+    # One fresh read and one write per tab
+    assert rook.reads + bastion.reads - reads_before == 2
+    assert len(rook.update_calls) == 1 and len(bastion.update_calls) == 1
+    # Same player twice in one batch: both logs count
+    assert (rook.cell(2, 8), rook.cell(2, 9)) == ("6", "3")
+    assert (rook.cell(3, 8), rook.cell(3, 9), rook.cell(3, 10)) == ("1", "1", "1")
+    assert bastion.cell(2, 8) == "4"
+
+
+async def test_apply_stat_changes_reports_per_player_errors(monkeypatch):
+    rook = rook_sheet(charlie=[["PVT", "Bob", "", "3", "1", "0"]])
+    install_sheets(monkeypatch, rook)
+    bob = await sheets.find_player("Bob")
+    ghost = _player(username="Ghost")
+    missing_tab = _player(sheet_name="[D] NOPE")
+    results = await sheets.apply_stat_changes([(bob, 1, 0, 0), (ghost, 1, 0, 0), (missing_tab, 1, 0, 0)])
+    assert results[0] is None
+    assert "no longer in" in str(results[1])
+    assert "Cannot find sheet" in str(results[2])
+    assert rook.cell(2, 8) == "4"
+
+
+async def test_apply_stat_changes_write_failure_marks_tab_failed(monkeypatch):
+    rook = rook_sheet(charlie=[["PVT", "Bob", "", "3", "1", "0"]])
+    install_sheets(monkeypatch, rook)
+    bob = await sheets.find_player("Bob")
+
+    async def boom(cells, value_input_option=None):
+        raise RuntimeError("write failed")
+
+    rook.update_cells = boom
+    (error,) = await sheets.apply_stat_changes([(bob, 1, 0, 0)])
+    assert str(error) == "write failed"
+
+
+async def test_concurrent_updates_to_same_player_are_not_lost(monkeypatch):
+    ws = rook_sheet(charlie=[["PVT", "Bob", "", "0", "0", "0"]])
+    install_sheets(monkeypatch, ws)
+    bob = await sheets.find_player("Bob")
+    await asyncio.gather(*[
+        sheets.update_player_stats(bob, ep_delta=1, tp_delta=0, mp_delta=0) for _ in range(5)
+    ])
+    assert ws.cell(2, 8) == "5"
+
+
+async def test_promote_and_scan_update_at_same_time_both_apply(monkeypatch):
+    ws = rook_sheet(charlie=[["PVT", "Bob", "", "10", "5", "0"]])
+    install_sheets(monkeypatch, ws)
+    bob = await sheets.find_player("Bob")
+    await asyncio.gather(
+        sheets.promote_rank(bob, "PFC"),
+        sheets.update_player_stats(bob, ep_delta=2, tp_delta=0, mp_delta=0),
+    )
+    # 10 - 9 (promotion) + 2 (log) = 3, whichever ran first
+    assert (ws.cell(2, 5), ws.cell(2, 8)) == ("PFC", "3")
+
+
+async def test_promote_uses_players_current_row(monkeypatch):
+    ws = rook_sheet(charlie=[
+        ["PVT", "Bob", "", "10", "5", "0"],
+        ["RCT", "Al", "", "0", "0", "0"],
+    ])
+    install_sheets(monkeypatch, ws)
+    bob = await sheets.find_player("Bob")
+    ws.values[2], ws.values[3] = ws.values[3], ws.values[2]  # rows moved since lookup
+    await sheets.promote_rank(bob, "PFC")
+    assert _section_rows(ws, 6, count=2) == [("PFC", "Bob", "1", "1"), ("RCT", "Al", "0", "0")]
+
+
+async def test_clear_row_does_not_wipe_someone_else_after_resort(monkeypatch):
+    ws = rook_sheet(charlie=[
+        ["PVT", "Ghost", "", "1", "1", "1"],
+        ["PVT", "Keep", "", "9", "9", "9"],
+    ])
+    install_sheets(monkeypatch, ws)
+    (ghost,) = await sheets.find_all_player_rows("Ghost")
+    ws.values[2], ws.values[3] = ws.values[3], ws.values[2]
+    assert await sheets.remove_player_rows([ghost]) == 1
+    assert (ws.cell(2, 6), ws.cell(2, 8)) == ("Keep", "9")
+    assert ws.cell(3, 6) == ""
+
+
+async def test_remove_player_rows_skips_players_already_gone(monkeypatch):
+    ws = rook_sheet(charlie=[["PVT", "Ghost", "", "1", "1", "1"]])
+    install_sheets(monkeypatch, ws)
+    (ghost,) = await sheets.find_all_player_rows("Ghost")
+    ws.values[2][6] = ""
+    assert await sheets.remove_player_rows([ghost]) == 0
+    assert ws.update_calls == []
+
+
+# ── SheetCache ───────────────────────────────────────────────────────
+
+async def test_sheet_cache_reads_each_tab_once(monkeypatch):
+    rook = rook_sheet(charlie=[["PVT", "A", "", "0", "0", "0"], ["PVT", "B", "", "0", "0", "0"]])
+    anc = ancillary_sheet([["RCT", "C", "Cy C", "0", "0", "0", "", ""]])
+    install_sheets(monkeypatch, rook, anc)
+    cache = sheets.SheetCache()
+    assert await cache.preload() == {}
+    for name in ["A", "B", "nobody", "C"]:
+        await sheets.find_player(name, cache=cache)
+    await sheets.find_ancillary_player("cy c", cache=cache)
+    await sheets.find_all_player_rows("A", cache=cache)
+    assert (rook.reads, anc.reads) == (1, 1)
+
+
+async def test_without_cache_every_lookup_reads(monkeypatch):
+    rook = rook_sheet(charlie=[["PVT", "A", "", "0", "0", "0"]])
+    install_sheets(monkeypatch, rook)
+    await sheets.find_player("A")
+    await sheets.find_player("A")
+    assert rook.reads == 2
+
+
+async def test_sheet_cache_remembers_failed_tab(monkeypatch):
+    broken = FakeWorksheet("[D] BASTION", [])
+    calls = 0
+
+    async def boom():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("API down")
+
+    broken.get_all_values = boom
+    rook = rook_sheet(charlie=[["PVT", "Bob", "", "0", "0", "0"]])
+    install_sheets(monkeypatch, broken, rook)
+    cache = sheets.SheetCache()
+    errors = await cache.preload()
+    assert list(errors) == ["[D] BASTION"]
+    assert (await sheets.find_player("Bob", cache=cache)).sheet_name == "[D] ROOK"
+    assert await sheets.find_player("Nobody", cache=cache) is None
+    assert calls == 1
+
+
+# ── Google API back-off ──────────────────────────────────────────────
+
+async def test_backoff_retries_then_gives_up(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(sheets.asyncio, "sleep", fake_sleep)
+    manager = sheets._BackoffClientManager(lambda: None)
+    err = RuntimeError("429")
+
+    def method():
+        pass
+
+    for _ in range(manager.MAX_RETRIES):
+        await manager.handle_gspread_error(err, method, (), {})
+    with pytest.raises(RuntimeError, match="429"):
+        await manager.handle_gspread_error(err, method, (), {})
+    assert len(sleeps) == manager.MAX_RETRIES
+    # Exponential, capped at MAX_BACKOFF (+ up to 1s jitter)
+    assert sleeps[0] < sleeps[1] < sleeps[2]
+    assert all(s <= manager.MAX_BACKOFF + 1 for s in sleeps)
+    # Counter resets after giving up
+    assert manager._failures == 0
+
+
+async def test_backoff_counter_resets_after_success(monkeypatch):
+    async def fake_sleep(seconds):
+        pass
+
+    monkeypatch.setattr(sheets.asyncio, "sleep", fake_sleep)
+    manager = sheets._BackoffClientManager(lambda: None)
+
+    async def ok_call(self, method, *args, **kwargs):
+        return "ok"
+
+    monkeypatch.setattr(sheets.AsyncioGspreadClientManager, "_call", ok_call)
+    await manager.handle_requests_error(RuntimeError("timeout"), ok_call, (), {})
+    assert manager._failures == 1
+    assert await manager._call(ok_call) == "ok"
+    assert manager._failures == 0
+
+
+async def test_transfer_within_same_sheet_clears_the_old_row(monkeypatch):
+    rook = rook_sheet(charlie=[["PFC", "Mover", "Mo", "7", "3", "1"], ["PVT", "Stay", "", "2", "0", "0"]])
+    install_sheets(monkeypatch, rook)
+    player = await sheets.find_player("Mover")
+    await sheets.transfer_player(player, "[D] ROOK", "Delta", "PFC")
+    # Old row emptied (the source section isn't re-sorted), neighbour untouched
+    assert [rook.cell(r, 6) for r in (2, 3)] == ["", "Stay"]
+    assert (rook.cell(2, 8), rook.cell(3, 8)) == ("", "2")
+    assert (rook.cell(2, 15), rook.cell(2, 17)) == ("Mover", "7")
+
+
+async def test_backoff_counter_resets_after_non_retryable_error(monkeypatch):
+    manager = sheets._BackoffClientManager(lambda: None)
+
+    async def failing_call(self, method, *args, **kwargs):
+        self._failures = 3  # pretend earlier retries happened
+        raise RuntimeError("403 forbidden")
+
+    monkeypatch.setattr(sheets.AsyncioGspreadClientManager, "_call", failing_call)
+    with pytest.raises(RuntimeError):
+        await manager._call(failing_call)
+    assert manager._failures == 0

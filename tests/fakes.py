@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from types import SimpleNamespace
 
@@ -12,10 +13,13 @@ class FakeWorksheet:
     def __init__(self, title: str, values: list[list[str]]):
         self.title = title
         self.values = values
+        self.reads = 0
         self.update_calls: list[list] = []
         self.update_cell_calls: list[tuple] = []
 
     async def get_all_values(self) -> list[list[str]]:
+        self.reads += 1
+        await asyncio.sleep(0)  # yield like a real API call, so concurrent commands can interleave
         return copy.deepcopy(self.values)
 
     def _set(self, row: int, col: int, value) -> None:
@@ -29,6 +33,7 @@ class FakeWorksheet:
         r[col - 1] = str(value).upper() if isinstance(value, bool) else value
 
     async def update_cells(self, cells, value_input_option=None) -> None:
+        await asyncio.sleep(0)
         self.update_calls.append(list(cells))
         for c in cells:
             self._set(c.row, c.col, c.value)

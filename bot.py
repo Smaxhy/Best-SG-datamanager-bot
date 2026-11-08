@@ -41,6 +41,26 @@ class DataManagerBot(discord.Client):
     def __init__(self) -> None:
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.tree.on_error = self.on_app_command_error
+        self._guild_commands_cleared = False
+
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """Reply when a command crashes, instead of leaving it stuck on "thinking…"."""
+        if isinstance(error, app_commands.CheckFailure):
+            text = "❌ You can't use this command here."
+        else:
+            name = interaction.command.name if interaction.command else "command"
+            logger.error("Error in /%s", name, exc_info=error)
+            text = "💥 Something went wrong running that command. Please try again — if it keeps happening, check the bot logs."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            logger.warning("Could not tell the user about the error (interaction expired).")
 
     async def setup_hook(self) -> None:
         # Ensure data directory exists (for SQLite)
@@ -69,11 +89,15 @@ class DataManagerBot(discord.Client):
         logger.info("Slash commands synced globally.")
 
     async def on_ready(self) -> None:
-        # Clear leftover guild-specific commands (fixes duplicates)
-        for guild in self.guilds:
-            self.tree.clear_commands(guild=guild)
-            await self.tree.sync(guild=guild)
-            logger.info("Cleared guild commands for %s", guild.name)
+        # Clear leftover guild-specific commands (fixes duplicates).
+        # on_ready fires again after every reconnect; syncing each time
+        # hits Discord's rate limits, so only do it once per start.
+        if not self._guild_commands_cleared:
+            self._guild_commands_cleared = True
+            for guild in self.guilds:
+                self.tree.clear_commands(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("Cleared guild commands for %s", guild.name)
         logger.info("Bot is online as %s (ID: %s)", self.user, self.user.id)
 
 
