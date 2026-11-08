@@ -716,34 +716,69 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
     return result
 
 
-async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[int, dict] | None:
-    """Find the first empty row in a subdivision's section."""
+def _row_is_empty(row: list[str], section: dict) -> bool:
+    """A row is free if both its USERNAME and LORE NAME cells are blank."""
+    for key in ("USERNAME", "LORE NAME"):
+        col = section["headers"].get(key)
+        if col is not None and col < len(row) and row[col].strip():
+            return False
+    return True
+
+
+def _subdivision_sections(sections: list[dict], sheet_name: str, subdivision: str) -> list[dict]:
+    """
+    Sections that make up *subdivision* on *sheet_name*, roster tables first.
+    Uses the USERNAME column from SUBDIVISION_MAP; if the sheet layout has
+    shifted and nothing is at that column, falls back to left-to-right order
+    of the roster sections (first subdivision = leftmost).
+    """
     subs = SUBDIVISION_MAP.get(sheet_name)
     if not subs or subdivision not in subs:
-        return None
-
+        return []
     target_col = subs[subdivision]
+    matches = [sec for sec in sections if sec["username_col"] == target_col]
+    if not matches:
+        roster_cols = sorted({sec["username_col"] for sec in sections if "EP" in sec["headers"]})
+        pos = list(subs).index(subdivision)
+        if pos < len(roster_cols):
+            logger.warning("No USERNAME column at %d for %s → %s; using roster column %d instead.",
+                           target_col, sheet_name, subdivision, roster_cols[pos])
+            matches = [sec for sec in sections if sec["username_col"] == roster_cols[pos]]
+    # A small table (e.g. command staff) can share the column; prefer the one with stats
+    return sorted(matches, key=lambda sec: "EP" not in sec["headers"])
+
+
+def _first_empty_row(all_values: list[list[str]], sections: list[dict]) -> tuple[int, dict] | None:
+    """(1-based row number, section) of the first free row in the given sections."""
+    for section in sections:
+        for row_idx, row in _section_rows(all_values, section):
+            if _row_is_empty(row, section):
+                return row_idx + 1, section
+    return None
+
+
+async def _find_empty_subdivision_row(sheet_name: str, subdivision: str):
+    """Returns (worksheet, 1-based row number, section) or None."""
+    if not SUBDIVISION_MAP.get(sheet_name, {}).get(subdivision):
+        return None
     ws = await _get_worksheet_safe(sheet_name)
     if ws is None:
         return None
-
     all_values = await ws.get_all_values()
-    sections = _find_table_sections(all_values)
+    sections = _subdivision_sections(_find_table_sections(all_values), sheet_name, subdivision)
+    found = _first_empty_row(all_values, sections)
+    if found is None:
+        return None
+    return ws, found[0], found[1]
 
-    for section in sections:
-        if section["username_col"] != target_col:
-            continue
-        header_row = section["header_row"]
-        headers = section["headers"]
-        for row_idx in range(header_row + 1, len(all_values)):
-            row = all_values[row_idx]
-            if target_col < len(row) and row[target_col].strip().upper() == "USERNAME":
-                break
-            cell_val = row[target_col].strip() if target_col < len(row) else ""
-            if not cell_val:
-                return (row_idx + 1, headers)
 
-    return None
+async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[int, dict] | None:
+    """Find the first empty row in a subdivision's section."""
+    found = await _find_empty_subdivision_row(sheet_name, subdivision)
+    if found is None:
+        return None
+    _ws, row_num, section = found
+    return row_num, section["headers"]
 
 
 async def _clear_player_row(player: PlayerRow) -> bool:
@@ -854,18 +889,14 @@ async def _transfer_player_locked(
         dest_mp = 0
 
     # Find empty row in destination
-    result = await find_empty_row_in_section(dest_sheet, subdivision)
+    result = await _find_empty_subdivision_row(dest_sheet, subdivision)
     if result is None:
         raise RuntimeError(
             f"No empty row found in {dest_sheet} → {subdivision}. Section might be full."
         )
 
-    dest_row, dest_headers = result
-
-    # Write to destination
-    ws_dest = await _get_worksheet_safe(dest_sheet)
-    if ws_dest is None:
-        raise RuntimeError(f"Cannot find sheet '{dest_sheet}'")
+    ws_dest, dest_row, dest_section = result
+    dest_headers = dest_section["headers"]
 
     updates = []
     for key, value in [
@@ -890,10 +921,10 @@ async def _transfer_player_locked(
 
     # Reorder destination section by rank
     all_values = await ws_dest.get_all_values()
-    sections = _find_table_sections(all_values)
-    target_col = SUBDIVISION_MAP.get(dest_sheet, {}).get(subdivision)
-    for section in sections:
-        if section["username_col"] == target_col:
+    for section in _find_table_sections(all_values):
+        if (section["header_row"], section["username_col"]) == (
+            dest_section["header_row"], dest_section["username_col"]
+        ):
             await _rewrite_section_sorted(ws_dest, section, all_values)
             break
 
@@ -1105,6 +1136,26 @@ async def find_ancillary_player(username: str, cache: SheetCache | None = None) 
 
 # ── Add player to any sheet ─────────────────────────────────────────
 
+class PlayerAlreadyExists(Exception):
+    """Raised by add_player_to_sheet when the username is already on that tab."""
+
+    def __init__(self, player: PlayerRow):
+        self.player = player
+        super().__init__(
+            f"**{player.username}** already exists in **{player.sheet_name}** (row {player.row_index})."
+        )
+
+
+def _find_exact_username(all_values: list[list[str]], username: str, ws_title: str) -> PlayerRow | None:
+    target = username.strip().lower()
+    for section in _find_table_sections(all_values):
+        ucol = section["username_col"]
+        for row_idx, row in _section_rows(all_values, section):
+            if ucol < len(row) and row[ucol].strip().lower() == target:
+                return _build_player(row, section["headers"], ws_title, row_idx)
+    return None
+
+
 async def add_player_to_sheet(
     username: str,
     lore_name: str,
@@ -1144,38 +1195,32 @@ async def _add_player_to_sheet_locked(
     if not sections:
         raise RuntimeError(f"No data sections found in '{sheet_name}'")
 
-    # If subdivision is given (Rook/Bastion), use the existing function
-    if subdivision and sheet_name in SUBDIVISION_MAP:
-        result = await find_empty_row_in_section(sheet_name, subdivision)
-        if result is None:
-            raise RuntimeError(f"No empty row in {sheet_name} → {subdivision}")
-        dest_row, headers = result
-    else:
-        # Find the first section with data columns (EP or DEVICE STATUS) and an empty row
-        # Skip bare command sections (only USERNAME/RANK/LORE NAME)
-        dest_row = None
-        headers = None
-        for section in sections:
-            h = section["headers"]
-            has_data_cols = "EP" in h or "DEVICE STATUS" in h
-            if not has_data_cols and len(h) <= 3:
-                continue  # skip bare command sections
-            header_row = section["header_row"]
-            username_col = section["username_col"]
-            for row_idx in range(header_row + 1, len(all_values)):
-                row = all_values[row_idx]
-                if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
-                    break
-                cell_val = row[username_col].strip() if username_col < len(row) else ""
-                if not cell_val:
-                    dest_row = row_idx + 1
-                    headers = h
-                    break
-            if dest_row:
-                break
+    # Only block if they're already on THIS tab (a player can be in Bastion
+    # and Device Wielders at once). Exact username only, not lore/first name.
+    existing = _find_exact_username(all_values, username, ws.title)
+    if existing is not None:
+        raise PlayerAlreadyExists(existing)
 
-        if dest_row is None or headers is None:
+    if subdivision and sheet_name in SUBDIVISION_MAP:
+        targets = _subdivision_sections(sections, sheet_name, subdivision)
+        if not targets:
+            raise RuntimeError(f"Couldn't find the {subdivision} table in {sheet_name}")
+        found = _first_empty_row(all_values, targets)
+        if found is None:
+            raise RuntimeError(f"No empty row in {sheet_name} → {subdivision}")
+    else:
+        # First section with data columns (EP or DEVICE STATUS) and an empty row.
+        # Skip bare command sections (only USERNAME/RANK/LORE NAME).
+        targets = [
+            sec for sec in sections
+            if "EP" in sec["headers"] or "DEVICE STATUS" in sec["headers"] or len(sec["headers"]) > 3
+        ]
+        found = _first_empty_row(all_values, targets)
+        if found is None:
             raise RuntimeError(f"No empty row found in '{sheet_name}'")
+
+    dest_row, dest_section = found
+    headers = dest_section["headers"]
 
     # Write the player — build fields based on what the section has
     fields = [
