@@ -7,7 +7,8 @@ import pytest
 from models.player import PlayerRow
 from services import sheets_service as sheets
 from tests.fakes import (
-    FakeWorksheet, ancillary_sheet, bastion_sheet, grid, install_sheets, put_section, rook_sheet,
+    STAT_HEADERS as STAT, FakeWorksheet, ancillary_sheet, bastion_sheet, grid, install_sheets, put_section,
+    rook_sheet,
 )
 
 
@@ -57,8 +58,8 @@ def test_find_sections_stops_at_next_username_header():
 
 def test_find_sections_stacked_vertically():
     values = grid(8, 8)
-    put_section(values, 0, 0, STAT := ["RANK", "USERNAME", "EP"], [["PVT", "A", "1"]])
-    put_section(values, 4, 0, STAT, [["RCT", "B", "2"]])
+    put_section(values, 0, 0, ["RANK", "USERNAME", "EP"], [["PVT", "A", "1"]])
+    put_section(values, 4, 0, ["RANK", "USERNAME", "EP"], [["RCT", "B", "2"]])
     assert [s["header_row"] for s in sheets._find_table_sections(values)] == [0, 4]
 
 
@@ -673,3 +674,100 @@ async def test_backoff_counter_resets_after_non_retryable_error(monkeypatch):
     with pytest.raises(RuntimeError):
         await manager._call(failing_call)
     assert manager._failures == 0
+
+
+# ── /addlog: add_player_to_sheet ─────────────────────────────────────
+
+async def test_add_player_blocks_exact_username_on_same_tab(monkeypatch):
+    rook = rook_sheet(delta=[["PVT", "Smaxhy", "Jessica Cruz", "1", "0", "0"]])
+    install_sheets(monkeypatch, rook)
+    with pytest.raises(sheets.PlayerAlreadyExists, match=r"\*\*Smaxhy\*\* already exists in \*\*\[D\] ROOK\*\* \(row 3\)"):
+        await sheets.add_player_to_sheet(" smaxhy ", "Jess", "[D] ROOK", "Charlie")
+    assert rook.update_calls == []
+
+
+async def test_add_player_not_blocked_by_someone_elses_lore_name(monkeypatch):
+    # Old check used the fuzzy search, so "Jessica" matched lore "Jessica Cruz"
+    anc = ancillary_sheet([["RCT", "Smaxhy", "Jessica Cruz", "0", "0", "0", "", ""]])
+    install_sheets(monkeypatch, anc)
+    await sheets.add_player_to_sheet("Jessica", "Jessica Hale", "[C] ANCILLARY")
+    assert (anc.cell(3, 2), anc.cell(3, 3)) == ("Jessica", "Jessica Hale")
+
+
+async def test_add_player_allowed_when_on_a_different_tab(monkeypatch):
+    rook = rook_sheet(charlie=[["PVT", "Smaxhy", "", "0", "0", "0"]])
+    anc = ancillary_sheet()
+    install_sheets(monkeypatch, rook, anc)
+    await sheets.add_player_to_sheet("Smaxhy", "Jess C", "[C] ANCILLARY")
+    assert anc.cell(2, 2) == "Smaxhy"
+
+
+async def test_add_player_skips_command_table_sharing_the_column(monkeypatch):
+    values = grid(14, 21)
+    # Small command-staff table at the Charlie column, roster below it
+    put_section(values, 0, 5, ["RANK", "USERNAME", "LORE NAME"], [["CPL", "Boss", "Big Boss"]])
+    put_section(values, 4, 5, ["RANK", "USERNAME", "LORE NAME", "EP", "TP", "MP"], [["PVT", "A", "Al", "0", "0", "0"]])
+    rook = FakeWorksheet("[D] ROOK", values)
+    install_sheets(monkeypatch, rook)
+    msg = await sheets.add_player_to_sheet("New", "New Guy", "[D] ROOK", "Charlie")
+    assert "(row 7)" in msg
+    assert (rook.cell(6, 6), rook.cell(6, 8)) == ("New", "0")
+    assert rook.cell(2, 6) == ""
+
+
+async def test_add_player_falls_back_when_columns_shifted(monkeypatch):
+    values = grid(8, 24)
+    # Same layout as normal but one column further right (USERNAME at 7 and 16)
+    put_section(values, 1, 6, STAT, [])
+    put_section(values, 1, 15, STAT, [])
+    rook = FakeWorksheet("[D] ROOK", values)
+    install_sheets(monkeypatch, rook)
+    await sheets.add_player_to_sheet("Left", "L", "[D] ROOK", "Charlie")
+    await sheets.add_player_to_sheet("Right", "R", "[D] ROOK", "Delta")
+    assert (rook.cell(2, 7), rook.cell(2, 16)) == ("Left", "Right")
+
+
+async def test_add_player_does_not_overwrite_half_filled_row(monkeypatch):
+    anc = ancillary_sheet([
+        ["RCT", "A", "Al", "0", "0", "0", "", ""],
+        ["", "", "Leftover Lore", "3", "", "", "", ""],
+    ])
+    install_sheets(monkeypatch, anc)
+    msg = await sheets.add_player_to_sheet("New", "New Guy", "[C] ANCILLARY")
+    assert "(row 5)" in msg
+    assert anc.cell(3, 3) == "Leftover Lore"
+    assert anc.cell(4, 2) == "New"
+
+
+async def test_add_player_full_subdivision(monkeypatch):
+    full = [["PVT", f"P{i}", "x", "0", "0", "0"] for i in range(3)]
+    install_sheets(monkeypatch, rook_sheet(charlie=full, rows=5))
+    with pytest.raises(RuntimeError, match="No empty row in"):
+        await sheets.add_player_to_sheet("New", "New Guy", "[D] ROOK", "Charlie")
+
+
+
+# ── Last-name lookup ─────────────────────────────────────────────────
+
+async def test_find_player_by_unique_last_name(monkeypatch):
+    install_sheets(monkeypatch, rook_sheet(charlie=[
+        ["PVT", "Grim_Noob456134", "Shin Fokoumi", "1", "0", "0"],
+        ["PVT", "Other", "Ann Vale", "0", "0", "0"],
+    ]))
+    assert (await sheets.find_player("fokoumi")).username == "Grim_Noob456134"
+
+
+async def test_find_player_ambiguous_last_name_returns_none(monkeypatch):
+    install_sheets(monkeypatch, rook_sheet(charlie=[
+        ["PVT", "A", "Shin Fokoumi", "0", "0", "0"],
+        ["PVT", "B", "Ren Fokoumi", "0", "0", "0"],
+    ]))
+    assert await sheets.find_player("Fokoumi") is None
+
+
+async def test_first_name_still_beats_last_name(monkeypatch):
+    install_sheets(monkeypatch, rook_sheet(charlie=[
+        ["PVT", "A", "Ren Vale", "0", "0", "0"],
+        ["PVT", "B", "Vale Hart", "0", "0", "0"],
+    ]))
+    assert (await sheets.find_player("Vale")).username == "B"
