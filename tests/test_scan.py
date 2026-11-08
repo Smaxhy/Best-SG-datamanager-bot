@@ -287,7 +287,7 @@ async def test_trainingbanned_player_is_skipped_and_recorded(monkeypatch):
 
 # ── Lore validation ──────────────────────────────────────────────────
 
-@pytest.mark.parametrize("log_lore", ["Bob Jones", "bob jones", "Bob", "  BOB "])
+@pytest.mark.parametrize("log_lore", ["Bob Jones", "bob jones", "Bob", "  BOB ", "Jones", "BobJones", "Bob J. Jones"])
 async def test_lore_name_matches_are_accepted(monkeypatch, log_lore):
     fake = FakeSheets(monkeypatch, [_row(lore="Bob Jones")])
     result = await _run([message(1, f"Username: Bob\nLore name: {log_lore}\nEP: 1")])
@@ -295,7 +295,7 @@ async def test_lore_name_matches_are_accepted(monkeypatch, log_lore):
     assert len(fake.updates) == 1
 
 
-@pytest.mark.parametrize("log_lore", ["Jones", "Bobby", "Bob Smith"])
+@pytest.mark.parametrize("log_lore", ["Bobby", "Bob Smith", "Alice Smith", "Jo"])
 async def test_lore_name_mismatch_is_flagged(monkeypatch, log_lore):
     fake = FakeSheets(monkeypatch, [_row(lore="Bob Jones")])
     result = await _run([message(1, f"Username: Bob\nLore name: {log_lore}\nEP: 1")])
@@ -314,3 +314,45 @@ async def test_unexpected_rank_is_informational_only(monkeypatch):
     fake = FakeSheets(monkeypatch, [_row(rank="SGT")])
     await _run([message(1, LOG)])
     assert len(fake.updates) == 1
+
+
+# ── Real cases that used to be flagged ───────────────────────────────
+
+@pytest.mark.parametrize("sheet_lore,log_lore", [
+    ("Cho Förscher", "Cho Luh Förscher"),       # extra middle name
+    ("LancelotBeccera", "Lancelot Beccerra"),   # missing space + typo
+    ("vastku", "Vast"),                         # short form
+    ("Cho Förscher", "Cho Forscher"),           # accent left off
+])
+def test_lore_matches_real_examples(sheet_lore, log_lore):
+    assert scan.lore_matches(log_lore, sheet_lore) is True
+
+
+@pytest.mark.parametrize("sheet_lore,log_lore", [
+    ("Cho Förscher", "Marcus Vale"),
+    ("Lancelot Beccera", "Percival Stone"),
+])
+def test_lore_matches_still_rejects_different_people(sheet_lore, log_lore):
+    assert scan.lore_matches(log_lore, sheet_lore) is False
+
+
+async def test_pasted_discord_nickname_finds_player(monkeypatch):
+    fake = FakeSheets(monkeypatch, [_row("Grim_Noob456134", "Shin Fokoumi")])
+    result = await _run([message(1, "Username: Shin Fokoumi | Grim_Noob456134\nEP: 2")])
+    assert result.players_not_found == 0
+    assert fake.updates == [("Grim_Noob456134", 2, 0, 0)]
+    (row,) = await _processed_rows()
+    assert row.username == "Grim_Noob456134"
+
+
+async def test_pasted_nickname_other_order(monkeypatch):
+    fake = FakeSheets(monkeypatch, [_row("Grim_Noob456134", "Shin Fokoumi")])
+    await _run([message(1, "Username: Grim_Noob456134 | Shin Fokoumi\nEP: 1")])
+    assert fake.updates == [("Grim_Noob456134", 1, 0, 0)]
+
+
+async def test_pasted_nickname_excluded_by_either_part(monkeypatch):
+    fake = FakeSheets(monkeypatch, [_row("Grim_Noob456134", "Shin Fokoumi")])
+    await _run([message(1, "Username: Shin Fokoumi | Grim_Noob456134\nEP: 1")],
+               excluded_names={"grim_noob456134"})
+    assert fake.updates == []

@@ -5,7 +5,10 @@ Orchestrates: message fetch → parse → sheet lookup → update → record.
 
 from __future__ import annotations
 
+import difflib
 import logging
+import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -24,6 +27,45 @@ BLACKLISTED_LORE_NAMES: set[str] = set()
 
 # ── Max stats per log entry ──────────────────────────────────────
 MAX_STAT_PER_LOG = 5
+
+
+def _name_key(text: str) -> str:
+    """Lowercase and drop accents, so "Förscher" and "Forscher" compare equal."""
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in text if not unicodedata.combining(c)).casefold()
+
+
+def lore_matches(log_lore: str, sheet_lore: str) -> bool:
+    """
+    Loose check that the lore name in a log belongs to the sheet's player.
+    The username already matched, so this only catches clearly different
+    names. Accepts spacing/accent differences, small typos, a middle name
+    added or left out, first or last name only, and short forms (Vast → Vastku).
+    """
+    log_words = re.findall(r"\w+", _name_key(log_lore))
+    sheet_words = re.findall(r"\w+", _name_key(sheet_lore))
+    if not log_words or not sheet_words:
+        return True
+    log_c, sheet_c = "".join(log_words), "".join(sheet_words)
+    if log_c == sheet_c:
+        return True
+    short, long = sorted((log_c, sheet_c), key=len)
+    if len(short) >= 3 and long.startswith(short):
+        return True
+    if set(log_words) <= set(sheet_words) or set(sheet_words) <= set(log_words):
+        return True
+    return difflib.SequenceMatcher(None, log_c, sheet_c).ratio() >= 0.85
+
+
+def _username_options(username: str) -> list[str]:
+    """
+    Names to try for a log's username. People sometimes paste their whole
+    Discord nickname ("Lore Name | Username"), so try each part, username side first.
+    """
+    if "|" not in username:
+        return [username]
+    parts = [p.strip() for p in username.split("|") if p.strip()]
+    return list(reversed(parts)) or [username]
 
 
 def _extract_text(message: discord.Message) -> str:
@@ -103,8 +145,11 @@ async def run_scan(
         logger.info("Parsed log: user='%s', lore='%s', EP=%d TP=%d MP=%d (msg %s)",
                     parsed.username, parsed.lore_name, parsed.ep, parsed.tp, parsed.mp, message.id)
 
+        name_options = _username_options(parsed.username)
+        option_keys = {n.strip().lower() for n in name_options}
+
         # ── Blacklist check ──────────────────────────────────────
-        if parsed.username.strip().lower() in BLACKLISTED_USERNAMES:
+        if option_keys & BLACKLISTED_USERNAMES:
             logger.info("  BLOCKED by username blacklist: '%s'", parsed.username)
             continue
         if parsed.lore_name and parsed.lore_name.strip().lower() in BLACKLISTED_LORE_NAMES:
@@ -115,7 +160,7 @@ async def run_scan(
 
         # ── Exclude check (per-scan exclusion) ─────────────────
         if excluded_names:
-            if parsed.username.strip().lower() in excluded_names:
+            if option_keys & excluded_names:
                 logger.info("  EXCLUDED by username: '%s'", parsed.username)
                 result.flagged_messages.append(
                     f"⏭️ **{parsed.username}** excluded from this scan."
@@ -157,7 +202,14 @@ async def run_scan(
 
         # ── Find player in sheets (pass lore name for disambiguation) ──
         try:
-            player = await sheets.find_player(parsed.username, parsed.lore_name, cache=cache)
+            player = None
+            for name in name_options:
+                player = await sheets.find_player(name, parsed.lore_name, cache=cache)
+                if player is not None:
+                    if name != parsed.username:
+                        logger.info("  Matched '%s' using '%s'", parsed.username, name)
+                        parsed.username = name
+                    break
         except Exception as exc:
             logger.exception("Sheets error while looking up '%s'.", parsed.username)
             result.errors += 1
@@ -224,14 +276,7 @@ async def run_scan(
 
         # ── Lore name validation (accepts partial/first-name matches) ──
         if parsed.lore_name and player.lore_name:
-            log_lore = parsed.lore_name.strip().lower()
-            sheet_lore = player.lore_name.strip().lower()
-            # Accept: exact match, first name match, or sheet lore starts with log lore
-            lore_ok = (
-                log_lore == sheet_lore
-                or sheet_lore.startswith(log_lore + " ")
-                or sheet_lore.split()[0] == log_lore if sheet_lore else False
-            )
+            lore_ok = lore_matches(parsed.lore_name, player.lore_name)
             if not lore_ok:
                 result.lore_mismatches += 1
                 result.flagged_messages.append(

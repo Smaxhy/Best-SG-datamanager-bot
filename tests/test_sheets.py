@@ -744,3 +744,30 @@ async def test_add_player_full_subdivision(monkeypatch):
     install_sheets(monkeypatch, rook_sheet(charlie=full, rows=5))
     with pytest.raises(RuntimeError, match="No empty row in"):
         await sheets.add_player_to_sheet("New", "New Guy", "[D] ROOK", "Charlie")
+
+
+
+# ── Last-name lookup ─────────────────────────────────────────────────
+
+async def test_find_player_by_unique_last_name(monkeypatch):
+    install_sheets(monkeypatch, rook_sheet(charlie=[
+        ["PVT", "Grim_Noob456134", "Shin Fokoumi", "1", "0", "0"],
+        ["PVT", "Other", "Ann Vale", "0", "0", "0"],
+    ]))
+    assert (await sheets.find_player("fokoumi")).username == "Grim_Noob456134"
+
+
+async def test_find_player_ambiguous_last_name_returns_none(monkeypatch):
+    install_sheets(monkeypatch, rook_sheet(charlie=[
+        ["PVT", "A", "Shin Fokoumi", "0", "0", "0"],
+        ["PVT", "B", "Ren Fokoumi", "0", "0", "0"],
+    ]))
+    assert await sheets.find_player("Fokoumi") is None
+
+
+async def test_first_name_still_beats_last_name(monkeypatch):
+    install_sheets(monkeypatch, rook_sheet(charlie=[
+        ["PVT", "A", "Ren Vale", "0", "0", "0"],
+        ["PVT", "B", "Vale Hart", "0", "0", "0"],
+    ]))
+    assert (await sheets.find_player("Vale")).username == "B"

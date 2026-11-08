@@ -249,6 +249,7 @@ async def find_player(
     exact_user: PlayerRow | None = None         # username matches
     exact_lore_as_user: PlayerRow | None = None # full lore name matches target
     first_name: PlayerRow | None = None         # first name of lore matches target
+    other_name: list[PlayerRow] = []            # last/middle name of lore matches target
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
@@ -326,6 +327,8 @@ async def find_player(
                                 p = _build_player(row, headers, ws.title, row_idx)
                                 if p.col_ep >= 0 and first_name.col_ep < 0:
                                     first_name = p
+                        elif target in lore_parts[1:]:
+                            other_name.append(_build_player(row, headers, ws.title, row_idx))
 
         except Exception:
             logger.exception("Error searching sheet '%s'.", sheet_name)
@@ -339,6 +342,16 @@ async def find_player(
         if match:
             logger.info("Returning %s match: '%s' in '%s'", label, match.username, match.sheet_name)
             return match
+
+    # 4. Last (or middle) name — only if it points to exactly one player
+    if other_name:
+        names = {p.username.lower() for p in other_name}
+        if len(names) == 1:
+            match = max(other_name, key=lambda p: p.col_ep >= 0)
+            logger.info("Returning last-name match: '%s' in '%s'", match.username, match.sheet_name)
+            return match
+        logger.warning("'%s' matches several players' lore names (%s) — not guessing.",
+                       username, ", ".join(sorted(names)))
 
     logger.warning("Player '%s' not found.", username)
     return None
