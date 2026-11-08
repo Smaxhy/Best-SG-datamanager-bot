@@ -88,6 +88,16 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             )
             return
 
+        # Stray/double spaces break later lookups by name
+        username = username.strip()
+        lorename = " ".join(lorename.split())
+        if not username or not lorename:
+            await interaction.response.send_message(
+                "❌ Username and lore name can't be blank.",
+                ephemeral=True,
+            )
+            return
+
         is_device = sheet.value == "DEVICE WIELDERS"
 
         # Rook/Bastion/Valkyrie require a subdivision
@@ -95,6 +105,13 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         if needs_sub and subdivision is None:
             await interaction.response.send_message(
                 f"❌ **{sheet.name}** requires a subdivision.",
+                ephemeral=True,
+            )
+            return
+
+        if subdivision and not needs_sub:
+            await interaction.response.send_message(
+                f"❌ **{sheet.name}** doesn't have subdivisions — leave that option empty.",
                 ephemeral=True,
             )
             return
@@ -125,16 +142,6 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         await interaction.response.defer()
 
-        # Duplicate check — only block if they already exist in the SAME sheet
-        # (a player CAN be in Bastion AND Device Wielders simultaneously)
-        existing = await sheets.find_player(username)
-        if existing and existing.sheet_name.strip().upper() == sheet.value.strip().upper():
-            await interaction.followup.send(
-                f"⚠️ **{username}** already exists in **{existing.sheet_name}** "
-                f"(row {existing.row_index})."
-            )
-            return
-
         # Build extra fields for Device Wielders
         extra_fields = {}
         if is_device:
@@ -152,6 +159,11 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 rank=rank.value if rank else "RCT",
                 extra_fields=extra_fields,
             )
+        except sheets.PlayerAlreadyExists as exc:
+            # Only blocks if they're already on the SAME tab
+            # (a player CAN be in Bastion AND Device Wielders simultaneously)
+            await interaction.followup.send(f"⚠️ {exc}")
+            return
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to add player: {exc}")
             return
