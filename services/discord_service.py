@@ -73,6 +73,17 @@ async def run_scan(
 
     players_touched: set[str] = set()
 
+    # Read each player tab once for the whole scan instead of once per log
+    cache = sheets.SheetCache()
+    for tab, exc in (await cache.preload()).items():
+        result.errors += 1
+        result.flagged_messages.append(
+            f"⚠️ Could not read sheet **{tab}**: {exc} — players on it will show as not found."
+        )
+
+    # Logs that passed every check; their points are written in one batch at the end
+    pending: list[tuple[discord.Message, ParsedLog, object]] = []
+
     async for message in channel.history(after=cutoff, oldest_first=True, limit=None):
         result.messages_checked += 1
 
@@ -146,7 +157,7 @@ async def run_scan(
 
         # ── Find player in sheets (pass lore name for disambiguation) ──
         try:
-            player = await sheets.find_player(parsed.username, parsed.lore_name)
+            player = await sheets.find_player(parsed.username, parsed.lore_name, cache=cache)
         except Exception as exc:
             logger.exception("Sheets error while looking up '%s'.", parsed.username)
             result.errors += 1
@@ -236,16 +247,16 @@ async def run_scan(
                 player.username, player.rank, player.sheet_name,
             )
 
-        # ── Update Google Sheets ─────────────────────────────────
-        try:
-            await sheets.update_player_stats(
-                player,
-                ep_delta=parsed.ep,
-                tp_delta=parsed.tp,
-                mp_delta=parsed.mp,
-            )
-        except Exception as exc:
-            logger.exception("Failed to update sheets for '%s'.", parsed.username)
+        pending.append((message, parsed, player))
+
+    # ── Update Google Sheets (one read + one write per tab) ─────
+    errors = await sheets.apply_stat_changes(
+        [(player, parsed.ep, parsed.tp, parsed.mp) for _, parsed, player in pending]
+    )
+
+    for (message, parsed, player), exc in zip(pending, errors):
+        if exc is not None:
+            logger.error("Failed to update sheets for '%s': %s", parsed.username, exc)
             result.errors += 1
             result.flagged_messages.append(
                 f"⚠️ Sheet update failed for **{parsed.username}**: {exc}"

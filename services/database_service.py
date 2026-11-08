@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import config
@@ -17,14 +18,23 @@ from models import Base, ProcessedLog, DataManagerStats, ScanHistory, CommandLog
 
 logger = logging.getLogger("bot.database")
 
-engine = create_async_engine(
-    config.DATABASE_URL,
-    echo=False,
-    pool_recycle=300,      # recycle connections every 5 min
-    pool_pre_ping=True,    # test connection before using it
-    pool_size=5,
-    max_overflow=5,
-)
+def _engine_kwargs(url: str) -> dict:
+    kwargs = {
+        "echo": False,
+        "pool_recycle": 300,      # recycle connections every 5 min
+        "pool_pre_ping": True,    # test connection before using it
+    }
+    parsed = make_url(url)
+    # In-memory SQLite uses a single shared connection (StaticPool),
+    # which rejects pool sizing arguments.
+    in_memory_sqlite = parsed.get_backend_name() == "sqlite" and parsed.database in (None, "", ":memory:")
+    if not in_memory_sqlite:
+        kwargs["pool_size"] = 5
+        kwargs["max_overflow"] = 5
+    return kwargs
+
+
+engine = create_async_engine(config.DATABASE_URL, **_engine_kwargs(config.DATABASE_URL))
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -79,6 +89,15 @@ async def record_processed_log(
 
 
 # ── Data Manager weekly stats ────────────────────────────────────────
+
+def _is_expired(expires_at: datetime | None) -> bool:
+    """True if *expires_at* has passed. SQLite returns naive datetimes; they are stored as UTC."""
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) >= expires_at
+
 
 def _iso_week() -> tuple[int, int]:
     now = datetime.now(timezone.utc)
@@ -375,7 +394,7 @@ async def is_ranklocked(username: str) -> RankLock | None:
         if lock is None:
             return None
         # Check if expired
-        if lock.expires_at and datetime.now(timezone.utc) >= lock.expires_at:
+        if _is_expired(lock.expires_at):
             await session.delete(lock)
             await session.commit()
             return None
@@ -441,7 +460,7 @@ async def is_trainingbanned(username: str) -> TrainingBan | None:
         ban = result.scalar_one_or_none()
         if ban is None:
             return None
-        if ban.expires_at and datetime.now(timezone.utc) >= ban.expires_at:
+        if _is_expired(ban.expires_at):
             await session.delete(ban)
             await session.commit()
             return None
@@ -455,10 +474,9 @@ async def get_all_trainingbans() -> list[TrainingBan]:
         result = await session.execute(stmt)
         bans = list(result.scalars().all())
         # Auto-clean expired
-        now = datetime.now(timezone.utc)
         active = []
         for ban in bans:
-            if ban.expires_at and now >= ban.expires_at:
+            if _is_expired(ban.expires_at):
                 await session.delete(ban)
             else:
                 active.append(ban)

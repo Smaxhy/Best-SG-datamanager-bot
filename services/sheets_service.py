@@ -6,8 +6,10 @@ Searches by username, lore name, or first name.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -35,7 +37,52 @@ def _get_credentials() -> Credentials:
     return creds
 
 
-agcm = AsyncioGspreadClientManager(_get_credentials)
+class _BackoffClientManager(AsyncioGspreadClientManager):
+    """
+    gspread_asyncio retries rate-limit (429) and server errors forever, every
+    1.1s, while holding the lock every other Sheets call waits on. That makes
+    one bad patch freeze the whole bot. Back off exponentially instead and give
+    up after a few tries so the command can report the error.
+    """
+
+    MAX_RETRIES = 6
+    MAX_BACKOFF = 60.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._failures = 0
+
+    async def _call(self, method, *args, **kwargs):
+        try:
+            return await super()._call(method, *args, **kwargs)
+        finally:
+            # Calls run one at a time, so this only resets the call that just finished
+            self._failures = 0
+
+    async def _backoff(self, e, method) -> None:
+        self._failures += 1
+        if self._failures > self.MAX_RETRIES:
+            self._failures = 0
+            logger.error("Google Sheets call %s failed %d times, giving up: %s",
+                         method.__name__, self.MAX_RETRIES + 1, e)
+            raise e
+        wait = min(self.MAX_BACKOFF, 2 ** self._failures) + random.uniform(0, 1)
+        logger.warning("Google Sheets call %s failed (%s), retry %d/%d in %.1fs",
+                       method.__name__, e, self._failures, self.MAX_RETRIES, wait)
+        await asyncio.sleep(wait)
+
+    async def handle_gspread_error(self, e, method, args, kwargs):
+        await self._backoff(e, method)
+
+    async def handle_requests_error(self, e, method, args, kwargs):
+        await self._backoff(e, method)
+
+
+agcm = _BackoffClientManager(_get_credentials)
+
+# Held while reading-then-writing a sheet, so two commands can't interleave
+# their read and write and overwrite each other's changes.
+_write_lock = asyncio.Lock()
 
 
 async def _get_spreadsheet():
@@ -59,6 +106,54 @@ async def _get_worksheet_safe(sheet_name: str):
             return ws
     logger.warning("No match for '%s' in any tab.", sheet_name)
     return None
+
+
+class SheetCache:
+    """
+    Remembers each tab's values for the length of one command, so looking up
+    many players costs one API read per tab instead of one per player.
+    Only used for finding players; every write re-reads the sheet first.
+    """
+
+    def __init__(self) -> None:
+        self._tabs: dict[str, tuple] = {}
+        self._errors: dict[str, Exception] = {}
+
+    async def read(self, sheet_name: str):
+        """
+        Return (worksheet, all_values), or (None, None) if the tab doesn't exist.
+        A failed read is remembered and re-raised, so a broken tab isn't retried
+        (with back-off) for every single player.
+        """
+        if sheet_name in self._errors:
+            raise self._errors[sheet_name]
+        if sheet_name not in self._tabs:
+            try:
+                ws = await _get_worksheet_safe(sheet_name)
+                values = await ws.get_all_values() if ws is not None else None
+            except Exception as exc:
+                self._errors[sheet_name] = exc
+                raise
+            self._tabs[sheet_name] = (ws, values)
+        return self._tabs[sheet_name]
+
+    async def preload(self) -> dict[str, Exception]:
+        """Read every player tab now. Returns {tab: error} for tabs that failed."""
+        for sheet_name in config.DETACHMENT_SHEETS:
+            try:
+                await self.read(sheet_name)
+            except Exception:
+                logger.exception("Could not read sheet '%s'.", sheet_name)
+        return dict(self._errors)
+
+
+async def _read_sheet(sheet_name: str, cache: SheetCache | None):
+    if cache is not None:
+        return await cache.read(sheet_name)
+    ws = await _get_worksheet_safe(sheet_name)
+    if ws is None:
+        return None, None
+    return ws, await ws.get_all_values()
 
 
 def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
@@ -136,7 +231,9 @@ def _build_player(row, headers, ws_title, row_idx) -> PlayerRow:
     )
 
 
-async def find_player(username: str, lore_name: str | None = None) -> PlayerRow | None:
+async def find_player(
+    username: str, lore_name: str | None = None, cache: SheetCache | None = None
+) -> PlayerRow | None:
     """
     Search priority:
     1. Exact username match (+ lore match if both given)
@@ -155,10 +252,9 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
-            ws = await _get_worksheet_safe(sheet_name)
+            ws, all_values = await _read_sheet(sheet_name, cache)
             if ws is None:
                 continue
-            all_values = await ws.get_all_values()
             logger.info("Sheet '%s': %d rows", ws.title, len(all_values))
 
             sections = _find_table_sections(all_values)
@@ -248,30 +344,131 @@ async def find_player(username: str, lore_name: str | None = None) -> PlayerRow 
     return None
 
 
+def _section_rows(all_values: list[list[str]], section: dict):
+    """Yield (row_idx, row) for the data rows under a section header."""
+    ucol = section["username_col"]
+    for row_idx in range(section["header_row"] + 1, len(all_values)):
+        row = all_values[row_idx]
+        if ucol < len(row) and row[ucol].strip().upper() == "USERNAME":
+            break
+        yield row_idx, row
+
+
+def _locate_player(all_values: list[list[str]], player: PlayerRow) -> tuple[int, dict] | None:
+    """
+    Find *player*'s row in freshly read sheet values. Rows move when sections
+    get re-sorted or players are transferred, so don't trust row_index blindly.
+    Returns (0-based row index, section) or None if they're gone.
+    """
+    target = player.username.strip().lower()
+    candidates = []
+    for section in _find_table_sections(all_values):
+        ucol = section["username_col"]
+        for row_idx, row in _section_rows(all_values, section):
+            if ucol < len(row) and row[ucol].strip().lower() == target:
+                candidates.append((row_idx, section))
+    if not candidates:
+        return None
+
+    def score(c):
+        row_idx, section = c
+        headers = section["headers"]
+        same_cols = headers.get("EP", -1) == player.col_ep
+        return (
+            row_idx == player.row_index - 1 and same_cols,
+            same_cols,
+            "EP" in headers,
+        )
+
+    return max(candidates, key=score)
+
+
+def _no_stat_columns_error(player: PlayerRow) -> RuntimeError:
+    return RuntimeError(
+        f"**{player.username}** found in **{player.sheet_name}** row {player.row_index} "
+        f"but that section has no EP/TP/MP columns — points not added."
+    )
+
+
+async def apply_stat_changes(
+    changes: list[tuple[PlayerRow, int, int, int]],
+) -> list[Exception | None]:
+    """
+    Add (ep, tp, mp) deltas for many players at once — one fresh read and one
+    write per tab. Totals are computed from the values in the sheet *now*, not
+    when the player was looked up, so edits made in the meantime aren't lost.
+
+    Returns one entry per change: None on success, or the error for that player.
+    """
+    results: list[Exception | None] = [None] * len(changes)
+    by_sheet: dict[str, list[int]] = {}
+    for i, (player, *_deltas) in enumerate(changes):
+        by_sheet.setdefault(player.sheet_name, []).append(i)
+
+    async with _write_lock:
+        for sheet_name, idxs in by_sheet.items():
+            try:
+                ws = await _get_worksheet_safe(sheet_name)
+                if ws is None:
+                    raise RuntimeError(f"Cannot find sheet '{sheet_name}' for update")
+                all_values = await ws.get_all_values()
+            except Exception as exc:
+                for i in idxs:
+                    results[i] = exc
+                continue
+
+            new_values: dict[tuple[int, int], int] = {}
+            applied: list[int] = []
+            for i in idxs:
+                player, ep_delta, tp_delta, mp_delta = changes[i]
+                found = _locate_player(all_values, player)
+                if found is None:
+                    results[i] = RuntimeError(
+                        f"**{player.username}** is no longer in **{sheet_name}** — points not added."
+                    )
+                    continue
+                row_idx, section = found
+                fresh = _build_player(all_values[row_idx], section["headers"], ws.title, row_idx)
+                stats = [
+                    (fresh.col_ep, fresh.ep, ep_delta),
+                    (fresh.col_tp, fresh.tp, tp_delta),
+                    (fresh.col_mp, fresh.mp, mp_delta),
+                ]
+                if all(col < 0 for col, _, _ in stats):
+                    logger.warning("No stat columns for %s in [%s] row %d — EP/TP/MP not updated!",
+                                   player.username, sheet_name, row_idx + 1)
+                    results[i] = _no_stat_columns_error(player)
+                    continue
+                for col, current, delta in stats:
+                    if col >= 0:
+                        key = (row_idx, col)
+                        new_values[key] = new_values.get(key, current) + delta
+                applied.append(i)
+                logger.info("Updating %s in [%s] row %d: EP %+d, TP %+d, MP %+d",
+                            player.username, sheet_name, row_idx + 1, ep_delta, tp_delta, mp_delta)
+
+            if not new_values:
+                continue
+            cells = [
+                gspread.Cell(row=r + 1, col=c + 1, value=str(v))
+                for (r, c), v in new_values.items()
+            ]
+            try:
+                await ws.update_cells(cells, value_input_option="RAW")
+            except Exception as exc:
+                logger.exception("Failed to write stats to '%s'.", sheet_name)
+                for i in applied:
+                    results[i] = exc
+
+    return results
+
+
 async def update_player_stats(
     player: PlayerRow, *, ep_delta: int, tp_delta: int, mp_delta: int
 ) -> None:
-    ws = await _get_worksheet_safe(player.sheet_name)
-    if ws is None:
-        raise RuntimeError(f"Cannot find sheet '{player.sheet_name}' for update")
-    updates: list[gspread.Cell] = []
-    if player.col_ep >= 0:
-        updates.append(gspread.Cell(row=player.row_index, col=player.col_ep + 1, value=str(player.ep + ep_delta)))
-    if player.col_tp >= 0:
-        updates.append(gspread.Cell(row=player.row_index, col=player.col_tp + 1, value=str(player.tp + tp_delta)))
-    if player.col_mp >= 0:
-        updates.append(gspread.Cell(row=player.row_index, col=player.col_mp + 1, value=str(player.mp + mp_delta)))
-    if updates:
-        await ws.update_cells(updates, value_input_option="RAW")
-        logger.info("Updated %s in [%s] row %d: EP %+d, TP %+d, MP %+d",
-                    player.username, player.sheet_name, player.row_index, ep_delta, tp_delta, mp_delta)
-    else:
-        logger.warning("No stat columns for %s in [%s] row %d — EP/TP/MP not updated!",
-                       player.username, player.sheet_name, player.row_index)
-        raise RuntimeError(
-            f"**{player.username}** found in **{player.sheet_name}** row {player.row_index} "
-            f"but that section has no EP/TP/MP columns — points not added."
-        )
+    (error,) = await apply_stat_changes([(player, ep_delta, tp_delta, mp_delta)])
+    if error is not None:
+        raise error
 
 
 # ── Promotion helpers ────────────────────────────────────────────────
@@ -455,81 +652,62 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
     """
     new_rank_upper = new_rank.strip().upper()
 
-    # Check requirements
+    # Quick check before taking the lock (re-checked against fresh values below)
     eligible, req_msg = check_promotion_requirements(player, new_rank_upper)
     if not eligible and not force:
         raise ValueError(req_msg)
 
-    ws = await _get_worksheet_safe(player.sheet_name)
-    if ws is None:
-        raise RuntimeError(f"Cannot find sheet '{player.sheet_name}'")
+    async with _write_lock:
+        ws = await _get_worksheet_safe(player.sheet_name)
+        if ws is None:
+            raise RuntimeError(f"Cannot find sheet '{player.sheet_name}'")
 
-    all_values = await ws.get_all_values()
-    sections = _find_table_sections(all_values)
+        all_values = await ws.get_all_values()
+        found = _locate_player(all_values, player)
+        if found is None:
+            raise RuntimeError(f"Player '{player.username}' not found in sheet '{player.sheet_name}'")
+        player_row_idx, target_section = found
+        headers = target_section["headers"]
 
-    # Find which section the player is in
-    target_section = None
-    player_row_idx = None
-    for section in sections:
-        ucol = section["username_col"]
-        header_row = section["header_row"]
-        for row_idx in range(header_row + 1, len(all_values)):
-            row = all_values[row_idx]
-            if ucol < len(row) and row[ucol].strip().upper() == "USERNAME":
-                break
-            if ucol < len(row) and row[ucol].strip().lower() == player.username.lower():
-                target_section = section
-                player_row_idx = row_idx
-                break
-        if target_section:
-            break
+        # Use the points in the sheet right now, not from when the player was looked up
+        current = _build_player(all_values[player_row_idx], headers, ws.title, player_row_idx)
+        eligible, req_msg = check_promotion_requirements(current, new_rank_upper)
+        if not eligible and not force:
+            raise ValueError(req_msg)
 
-    if target_section is None:
-        raise RuntimeError(f"Player '{player.username}' not found in sheet '{player.sheet_name}'")
+        # Calculate new point values after deduction
+        req = RANK_REQUIREMENTS.get(new_rank_upper)
+        if req and not force:
+            new_ep = current.ep - req["ep"]
+            new_tp = current.tp - req["tp"]
+            new_mp = current.mp - req["mp"]
+        else:
+            new_ep = current.ep
+            new_tp = current.tp
+            new_mp = current.mp
 
-    headers = target_section["headers"]
-
-    # Calculate new point values after deduction
-    req = RANK_REQUIREMENTS.get(new_rank_upper)
-    if req and not force:
-        new_ep = player.ep - req["ep"]
-        new_tp = player.tp - req["tp"]
-        new_mp = player.mp - req["mp"]
-    else:
-        new_ep = player.ep
-        new_tp = player.tp
-        new_mp = player.mp
-
-    # Write rank + deducted points
-    updates = []
-    rank_col = headers.get("RANK")
-    if rank_col is not None:
-        updates.append(gspread.Cell(row=player.row_index, col=rank_col + 1, value=new_rank_upper))
-    ep_col = headers.get("EP")
-    if ep_col is not None:
-        updates.append(gspread.Cell(row=player.row_index, col=ep_col + 1, value=str(new_ep)))
-    tp_col = headers.get("TP")
-    if tp_col is not None:
-        updates.append(gspread.Cell(row=player.row_index, col=tp_col + 1, value=str(new_tp)))
-    mp_col = headers.get("MP")
-    if mp_col is not None and req and req["mp"] > 0:
-        updates.append(gspread.Cell(row=player.row_index, col=mp_col + 1, value=str(new_mp)))
-
-    if updates:
-        await ws.update_cells(updates, value_input_option="RAW")
-
-    # Also update the in-memory data for reordering
-    if player_row_idx is not None:
+        # Write rank + deducted points
+        row_num = player_row_idx + 1
+        updates = []
+        rank_col = headers.get("RANK")
         if rank_col is not None:
-            all_values[player_row_idx][rank_col] = new_rank_upper
+            updates.append(gspread.Cell(row=row_num, col=rank_col + 1, value=new_rank_upper))
+        ep_col = headers.get("EP")
         if ep_col is not None:
-            all_values[player_row_idx][ep_col] = str(new_ep)
+            updates.append(gspread.Cell(row=row_num, col=ep_col + 1, value=str(new_ep)))
+        tp_col = headers.get("TP")
         if tp_col is not None:
-            all_values[player_row_idx][tp_col] = str(new_tp)
+            updates.append(gspread.Cell(row=row_num, col=tp_col + 1, value=str(new_tp)))
+        mp_col = headers.get("MP")
+        if mp_col is not None and req and req["mp"] > 0:
+            updates.append(gspread.Cell(row=row_num, col=mp_col + 1, value=str(new_mp)))
 
-    # Re-read and reorder the section
-    all_values = await ws.get_all_values()
-    await _rewrite_section_sorted(ws, target_section, all_values)
+        if updates:
+            await ws.update_cells(updates, value_input_option="RAW")
+
+        # Re-read and reorder the section
+        all_values = await ws.get_all_values()
+        await _rewrite_section_sorted(ws, target_section, all_values)
 
     logger.info("Promoted %s to %s in [%s], points deducted, section reordered",
                 player.username, new_rank_upper, player.sheet_name)
@@ -568,33 +746,29 @@ async def find_empty_row_in_section(sheet_name: str, subdivision: str) -> tuple[
     return None
 
 
-async def _clear_player_row(player: PlayerRow) -> None:
-    """Clear all fields for a player in their current sheet."""
+async def _clear_player_row(player: PlayerRow) -> bool:
+    """
+    Clear all fields for a player in their current sheet.
+    Caller must hold _write_lock. Returns False if the player wasn't found.
+    """
     ws = await _get_worksheet_safe(player.sheet_name)
     if ws is None:
-        return
+        return False
 
     all_values = await ws.get_all_values()
-    sections = _find_table_sections(all_values)
-    clear_cells = []
+    found = _locate_player(all_values, player)
+    if found is None:
+        logger.warning("Could not find %s in [%s] to clear — nothing removed.",
+                       player.username, player.sheet_name)
+        return False
 
-    for section in sections:
-        ucol = section["username_col"]
-        if ucol < len(all_values[player.row_index - 1]):
-            if all_values[player.row_index - 1][ucol].strip().lower() == player.username.lower():
-                for key, col in section["headers"].items():
-                    clear_cells.append(gspread.Cell(row=player.row_index, col=col + 1, value=""))
-                break
-
-    # Also clear EP/TP/MP if they're in separate columns not in headers
-    for col in [player.col_ep, player.col_tp, player.col_mp]:
-        if col >= 0:
-            already = any(c.row == player.row_index and c.col == col + 1 for c in clear_cells)
-            if not already:
-                clear_cells.append(gspread.Cell(row=player.row_index, col=col + 1, value=""))
-
-    if clear_cells:
-        await ws.update_cells(clear_cells, value_input_option="RAW")
+    row_idx, section = found
+    clear_cells = [
+        gspread.Cell(row=row_idx + 1, col=col + 1, value="")
+        for col in sorted(set(section["headers"].values()))
+    ]
+    await ws.update_cells(clear_cells, value_input_option="RAW")
+    return True
 
 
 def _is_ancillary(sheet_name: str) -> bool:
@@ -623,6 +797,27 @@ async def transfer_player(
     Returns a dict with: message, mode ("promotion"|"transfer"), old_ep/tp/mp,
     new_ep/tp/mp, deducted_ep/tp/mp, old_rank, new_rank.
     """
+    async with _write_lock:
+        return await _transfer_player_locked(player, dest_sheet, subdivision, new_rank)
+
+
+async def _transfer_player_locked(
+    player: PlayerRow,
+    dest_sheet: str,
+    subdivision: str,
+    new_rank: str,
+) -> dict:
+    # Use the player's points as they are in the sheet right now
+    ws_src = await _get_worksheet_safe(player.sheet_name)
+    if ws_src is not None:
+        src_values = await ws_src.get_all_values()
+        found = _locate_player(src_values, player)
+        if found is not None:
+            row_idx, section = found
+            fresh = _build_player(src_values[row_idx], section["headers"], ws_src.title, row_idx)
+            fresh.sheet_name = player.sheet_name
+            player = fresh
+
     from_ancillary = _is_ancillary(player.sheet_name)
     to_rook_bastion = _is_rook_or_bastion(dest_sheet)
     lateral = _is_rook_or_bastion(player.sheet_name) and to_rook_bastion
@@ -689,7 +884,9 @@ async def transfer_player(
         await ws_dest.update_cells(updates, value_input_option="RAW")
 
     # Clear from old sheet
-    await _clear_player_row(player)
+    if not await _clear_player_row(player):
+        logger.warning("Transferred %s but could not clear their old row in %s.",
+                       player.username, player.sheet_name)
 
     # Reorder destination section by rank
     all_values = await ws_dest.get_all_values()
@@ -750,17 +947,16 @@ async def transfer_player(
 
 # ── Deathlog: find and remove player from ALL sheets ────────────────
 
-async def find_all_player_rows(username: str) -> list[PlayerRow]:
+async def find_all_player_rows(username: str, cache: SheetCache | None = None) -> list[PlayerRow]:
     """Find a player across ALL sheets — returns every row they appear in."""
     target = username.strip().lower()
     found: list[PlayerRow] = []
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
-            ws = await _get_worksheet_safe(sheet_name)
+            ws, all_values = await _read_sheet(sheet_name, cache)
             if ws is None:
                 continue
-            all_values = await ws.get_all_values()
             sections = _find_table_sections(all_values)
 
             for section in sections:
@@ -806,7 +1002,10 @@ async def remove_player_rows(players: list[PlayerRow]) -> int:
     removed = 0
     for player in players:
         try:
-            await _clear_player_row(player)
+            async with _write_lock:
+                cleared = await _clear_player_row(player)
+            if not cleared:
+                continue
             removed += 1
             logger.info("Deathlog: removed %s from %s row %d",
                         player.username, player.sheet_name, player.row_index)
@@ -822,6 +1021,11 @@ async def set_exam_checkmark(username: str) -> bool:
     Find a player in the Ancillary sheet and set their EXAM checkbox to TRUE.
     Returns True if found and updated.
     """
+    async with _write_lock:
+        return await _set_exam_checkmark_locked(username)
+
+
+async def _set_exam_checkmark_locked(username: str) -> bool:
     for sheet_name in config.DETACHMENT_SHEETS:
         if not _is_ancillary(sheet_name):
             continue
@@ -862,18 +1066,17 @@ async def set_exam_checkmark(username: str) -> bool:
     return False
 
 
-async def find_ancillary_player(username: str) -> PlayerRow | None:
+async def find_ancillary_player(username: str, cache: SheetCache | None = None) -> PlayerRow | None:
     """Find a player specifically in the Ancillary sheet."""
     target = username.strip().lower()
     for sheet_name in config.DETACHMENT_SHEETS:
         if not _is_ancillary(sheet_name):
             continue
 
-        ws = await _get_worksheet_safe(sheet_name)
+        ws, all_values = await _read_sheet(sheet_name, cache)
         if ws is None:
             continue
 
-        all_values = await ws.get_all_values()
         sections = _find_table_sections(all_values)
 
         for section in sections:
@@ -917,6 +1120,20 @@ async def add_player_to_sheet(
 
     Returns a success message string.
     """
+    async with _write_lock:
+        return await _add_player_to_sheet_locked(
+            username, lore_name, sheet_name, subdivision, rank, extra_fields
+        )
+
+
+async def _add_player_to_sheet_locked(
+    username: str,
+    lore_name: str,
+    sheet_name: str,
+    subdivision: str | None,
+    rank: str,
+    extra_fields: dict | None,
+) -> str:
     ws = await _get_worksheet_safe(sheet_name)
     if ws is None:
         raise RuntimeError(f"Cannot find sheet '{sheet_name}'")
