@@ -33,6 +33,24 @@ def _has_permission(interaction: discord.Interaction) -> bool:
 PROMOTION_CHANNEL_ID = 1511781917693972601
 
 
+async def _blocked_by_ranklock(interaction: discord.Interaction, typed: str, player) -> bool:
+    """Check the lock against the real sheet username, not just what was typed.
+
+    find_player() also matches lore names and first names, so checking only the
+    typed text let `/promote username:<lore first name>` skip a rank lock.
+    """
+    for name in dict.fromkeys([player.username, typed]):
+        lock = await db.is_ranklocked(name)
+        if lock:
+            await interaction.followup.send(
+                f"🔒 **{player.username}** is rank-locked by **{lock.locked_by_name}**"
+                + (f" — {lock.reason}" if lock.reason else "")
+                + "\nUse `/unranklock` to unlock them first."
+            )
+            return True
+    return False
+
+
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
     @tree.command(name="promote", description="Promote a player's rank or transfer them between detachments")
@@ -103,21 +121,13 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         await interaction.response.defer()
 
-        # Check ranklock
-        lock = await db.is_ranklocked(username)
-        if lock:
-            await interaction.followup.send(
-                f"🔒 **{username}** is rank-locked by **{lock.locked_by_name}**"
-                + (f" — {lock.reason}" if lock.reason else "")
-                + "\nUse `/unranklock` to unlock them first."
-            )
-            return
-
         if detachment and subdivision:
             # ── TRANSFER / PROMOTION: move player to new detachment ──
             player = await sheets.find_player(username)
             if player is None:
                 await interaction.followup.send(f"❌ Player **{username}** not found.")
+                return
+            if await _blocked_by_ranklock(interaction, username, player):
                 return
 
             try:
@@ -212,6 +222,8 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
             player = await sheets.find_player(username)
             if player is None:
                 await interaction.followup.send(f"❌ Player **{username}** not found.")
+                return
+            if await _blocked_by_ranklock(interaction, username, player):
                 return
 
             old_rank = player.rank

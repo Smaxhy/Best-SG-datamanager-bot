@@ -214,3 +214,18 @@ async def test_expired_trainingban_is_removed():
     active = await db.get_all_trainingbans()
     assert [b.username for b in active] == ["alice"]
     assert await db.is_trainingbanned("Bob") is None
+
+
+async def test_expired_ranklock_does_not_block_relocking():
+    await db.ranklock_player("Bob", 1, "Max", hours=1)
+    await _expire(RankLock, "Bob")
+    assert await db.ranklock_player("Bob", 2, "Jo") is True
+    lock = await db.is_ranklocked("Bob")
+    assert lock is not None and lock.locked_by_name == "Jo"
+
+
+async def test_ranklock_list_hides_expired_locks():
+    await db.ranklock_player("Bob", 1, "Max", hours=1)
+    await db.ranklock_player("Amy", 1, "Max")
+    await _expire(RankLock, "Bob")
+    assert [l.username for l in await db.get_all_ranklocks()] == ["amy"]

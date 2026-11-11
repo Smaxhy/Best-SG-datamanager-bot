@@ -53,7 +53,10 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         )
 
         try:
-            await target.send(message)
+            await target.send(
+                message,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+            )
             if channel and channel.id != interaction.channel_id:
                 await interaction.response.send_message(
                     f"✅ Message sent in {channel.mention}", ephemeral=True

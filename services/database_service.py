@@ -358,7 +358,10 @@ async def ranklock_player(username: str, locked_by_id: int, locked_by_name: str,
         result = await session.execute(stmt)
         existing = result.scalar_one_or_none()
         if existing:
-            return False
+            if not _is_expired(existing.expires_at):
+                return False
+            await session.delete(existing)
+            await session.flush()
         expires = datetime.now(timezone.utc) + timedelta(hours=hours) if hours else None
         lock = RankLock(
             username=username.lower(),
@@ -405,7 +408,7 @@ async def get_all_ranklocks() -> list[RankLock]:
     async with async_session() as session:
         stmt = select(RankLock).order_by(RankLock.locked_at.desc())
         result = await session.execute(stmt)
-        return list(result.scalars().all())
+        return [lock for lock in result.scalars().all() if not _is_expired(lock.expires_at)]
 
 
 # ── Training ban functions ──────────────────────────────────────────
