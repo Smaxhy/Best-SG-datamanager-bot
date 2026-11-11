@@ -2,9 +2,15 @@
 /purge command — bulk delete messages in a channel (max 20).
 
 Usage:  /purge amount:10
+
+Deletes the newest ``amount`` messages posted *before* the command was run,
+working upwards from where it was typed (newest first). Messages older than
+3 days are never touched.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -58,12 +64,17 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         await interaction.response.defer(ephemeral=True)
 
         # Only delete messages from the last 3 days
-        from datetime import datetime, timedelta, timezone
         cutoff = datetime.now(timezone.utc) - timedelta(days=3)
 
+        # Work upwards from the moment /purge was typed.
+        # discord.py defaults to oldest_first=True whenever ``after`` is set,
+        # which made purge start at the 3-day cutoff and delete the oldest
+        # messages in that window instead of the ones just above the command.
         deleted = await interaction.channel.purge(
             limit=amount,
+            before=interaction.created_at,
             after=cutoff,
+            oldest_first=False,
         )
 
         await db.log_command(
