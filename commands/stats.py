@@ -27,7 +27,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
         # If looking up someone else, require Staff role
         if user and user.id != interaction.user.id:
-            role_ids = {r.id for r in interaction.user.roles}
+            role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
             if config.STAFF_ROLE_ID not in role_ids:
                 await interaction.response.send_message(
                     "❌ Only Staff can view another user's stats.", ephemeral=True

@@ -80,3 +80,13 @@ async def test_guild_commands_cleared_only_once(client, monkeypatch):
     await client.on_ready()
     await client.on_ready()  # reconnect
     assert synced == [guild]
+
+
+def test_examcheck_fit_field_respects_discord_limit():
+    from commands.examcheck import _fit_field
+
+    lines = "\n".join(f"**Player{i}** (<@{10**17 + i}>) — 13/14 ✅" for i in range(40))
+    out = _fit_field(lines)
+    assert len(out) <= 1024
+    assert out.endswith("(list trimmed)")
+    assert _fit_field("short") == "short"

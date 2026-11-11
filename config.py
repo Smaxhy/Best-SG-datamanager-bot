@@ -8,11 +8,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _int_env(name: str, default: int = 0) -> int:
+    """Read an int env var; treat blank values (allowed on Railway) as unset."""
+    raw = (os.getenv(name) or "").strip()
+    return int(raw) if raw else default
+
 # ── Discord ──────────────────────────────────────────────────────────
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-DATA_MANAGER_ROLE_ID = int(os.getenv("DATA_MANAGER_ROLE_ID", "0"))
-STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "0"))
-NCO_ROLE_ID = int(os.getenv("NCO_ROLE_ID", "0"))
+DATA_MANAGER_ROLE_ID = _int_env("DATA_MANAGER_ROLE_ID")
+STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
+NCO_ROLE_ID = _int_env("NCO_ROLE_ID")
 
 # Optional: restrict which channels can be scanned (comma-separated IDs)
 # Leave empty to allow any channel the bot can read.
@@ -35,10 +41,15 @@ _SHEETS_RAW = os.getenv("PLAYER_SHEETS", _DEFAULT_SHEETS)
 DETACHMENT_SHEETS: list[str] = [s.strip() for s in _SHEETS_RAW.split(",") if s.strip()]
 
 # ── Scan settings ────────────────────────────────────────────────────
-SCAN_HOURS = int(os.getenv("SCAN_HOURS", "48"))
+SCAN_HOURS = _int_env("SCAN_HOURS", 48)
 
 # ── Database ─────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/bot.db")
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip() or "sqlite+aiosqlite:///./data/bot.db"
+# Railway/Heroku hand out plain postgres:// URLs; the bot needs the async driver.
+for _prefix in ("postgres://", "postgresql://"):
+    if DATABASE_URL.startswith(_prefix):
+        DATABASE_URL = "postgresql+asyncpg://" + DATABASE_URL[len(_prefix):]
+        break
 
 # ── Valid game constants ─────────────────────────────────────────────
 VALID_RANKS = {"RCT", "PVT", "PFC", "LCPL"}

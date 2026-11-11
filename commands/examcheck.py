@@ -41,6 +41,17 @@ def _has_permission(interaction: discord.Interaction) -> bool:
     )
 
 
+def _fit_field(text: str, limit: int = 1024) -> str:
+    """Trim an embed field to Discord's limit, cutting at a line break."""
+    if len(text) <= limit:
+        return text
+    suffix = "\n… (list trimmed)"
+    cut = text[: limit - len(suffix)]
+    if "\n" in cut:
+        cut = cut[: cut.rfind("\n")]
+    return cut + suffix
+
+
 def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
 
     @tree.command(
@@ -98,7 +109,9 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
         # Format expected: @member XX/14  (the score is in the message text)
         results: dict[int, dict] = {}  # member_id -> {member, nickname, score}
 
-        async for message in channel.history(after=cutoff, limit=5000):
+        # Newest first so a member's latest score (e.g. a passed retake) wins —
+        # discord.py reads oldest-first by default whenever `after` is set.
+        async for message in channel.history(after=cutoff, limit=5000, oldest_first=False):
             if not message.mentions:
                 continue
 
@@ -238,7 +251,7 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 text += f"\n… and {len(passed_players) - 20} more"
             embed.add_field(
                 name=f"✅ Passed — Exam Checked ({len(passed_players)})",
-                value=text, inline=False,
+                value=_fit_field(text), inline=False,
             )
 
         if failed:
@@ -253,14 +266,14 @@ def register(tree: app_commands.CommandTree, bot: discord.Client) -> None:
                 text += f"\n… and {len(failed) - 20} more"
             embed.add_field(
                 name=f"❌ Failed — Retake Required ({len(failed)})",
-                value=text, inline=False,
+                value=_fit_field(text), inline=False,
             )
 
         if check_errors:
             text = "\n".join(check_errors[:10])
             if len(check_errors) > 10:
                 text += f"\n… and {len(check_errors) - 10} more"
-            embed.add_field(name="⚠️ Issues", value=text, inline=False)
+            embed.add_field(name="⚠️ Issues", value=_fit_field(text), inline=False)
 
         if not results:
             embed.description = (
