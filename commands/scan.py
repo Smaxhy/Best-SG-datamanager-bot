@@ -12,6 +12,7 @@ import discord
 from discord import app_commands
 
 import config
+from parser.names import name_key
 from services.discord_service import run_scan
 from services import database_service as db
 
@@ -144,7 +145,7 @@ async def _scan(
     # Parse excluded usernames
     excluded_names: set[str] = set()
     if exclude:
-        excluded_names = {name.strip().lower() for name in exclude.split(",") if name.strip()}
+        excluded_names = {name_key(name) for name in exclude.split(",") if name.strip()}
 
     try:
         result = await run_scan(channel, interaction.user, excluded_names=excluded_names, force=force)

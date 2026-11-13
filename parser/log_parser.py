@@ -24,14 +24,23 @@ from __future__ import annotations
 
 import re
 from models.player import ParsedLog
+from parser.names import clean_name, strip_markdown
 
 MAX_EP_PER_LOG = 5
 MAX_TP_PER_LOG = 5
 MAX_MP_PER_LOG = 5
 
 # ── Compiled patterns (case-insensitive) ─────────────────────────────
-_RE_USERNAME = re.compile(r"username\s*:\s*(.+)", re.IGNORECASE)
-_RE_LORE     = re.compile(r"lore\s*name\s*:\s*(.+)", re.IGNORECASE)
+# Accepts "Username: X", "User name - X", "Roblox username = X", "IGN: X", "User: X"
+_RE_USERNAME = re.compile(
+    r"^[^\w\n]*(?:\d+[.)][ \t]*)?(?:roblox[ \t]*)?(?:user[ \t]*name|user|ign)[ \t]*(?:[:=]|[ \t][-–—])[ \t]*(.+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Accepts "Lore name: X", "Lorename - X", "Lore: X"
+_RE_LORE     = re.compile(
+    r"^[^\w\n]*(?:\d+[.)][ \t]*)?lore[ \t]*(?:name)?[ \t]*(?:[:=]|[ \t][-–—])[ \t]*(.+)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Match both "EP: 2" / "EP 2" AND "2 EP" / "2EP" (same line only)
 _RE_EP       = re.compile(r"(?:\bEP[ \t]*:?[ \t]*([+-]?\d+)|([+-]?\d+)[ \t]*EP\b)", re.IGNORECASE)
@@ -85,6 +94,10 @@ def parse_log(content: str) -> ParsedLog | None:
     if not content or len(content) < 5:
         return None
 
+    # "**Username:** Smaxhy" / "__EP:__ 2" — drop Discord formatting first,
+    # otherwise the markdown ends up inside the name or hides the stat.
+    content = strip_markdown(content)
+
     # At least one stat must be present for this to be a log
     m_ep = _RE_EP.search(content)
     m_tp = _RE_TP.search(content)
@@ -123,7 +136,7 @@ def parse_log(content: str) -> ParsedLog | None:
             if _RE_EP.search(stripped) or _RE_TP.search(stripped) or _RE_MP.search(stripped):
                 continue
             # Skip lines that look like labelled fields
-            if re.match(r"^(username|lore\s*name)\s*:", stripped, re.IGNORECASE):
+            if _RE_USERNAME.match(stripped) or _RE_LORE.match(stripped):
                 continue
             plain_lines.append(stripped)
 
@@ -135,8 +148,11 @@ def parse_log(content: str) -> ParsedLog | None:
     if not username:
         return None
 
-    # Clean up username — remove any trailing colons or extra whitespace
-    username = username.strip().rstrip(":")
+    # Clean up — stray "@", quotes, trailing colons, extra whitespace
+    username = clean_name(username)
+    lore_name = clean_name(lore_name) or None if lore_name else None
+    if not username:
+        return None
 
     # Skip if username looks like a sentence (too many words = probably chat)
     if len(username.split()) > 4:
