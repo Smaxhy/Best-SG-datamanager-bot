@@ -1,15 +1,18 @@
 """
 Google Sheets service — finds players across multi-section sheets.
-Only checks [D] ROOK, [D] BASTION, [C] ANCILLARY and their subdivisions.
-Searches by username, lore name, or first name.
+Searches every tab in config.DETACHMENT_SHEETS by username, lore name, or
+first name. All name comparisons go through parser.names.name_key so that
+markdown, "@", invisible characters and capitalisation don't cause misses.
 """
 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import random
+import re
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -17,6 +20,7 @@ from gspread_asyncio import AsyncioGspreadClientManager
 
 import config
 from models.player import PlayerRow
+from parser.names import loose_key, name_key
 
 logger = logging.getLogger("bot.sheets")
 
@@ -156,25 +160,35 @@ async def _read_sheet(sheet_name: str, cache: SheetCache | None):
     return ws, await ws.get_all_values()
 
 
+def _header_key(cell: str) -> str:
+    """'Lore Name:' / ' LORE  NAME ' / 'lore-name' -> 'LORE NAME'."""
+    return " ".join(re.sub(r"[^A-Z0-9]+", " ", cell.upper()).split())
+
+
+def _is_username_header(cell: str) -> bool:
+    """Accept 'USERNAME', 'Username:', 'User Name', 'USERNAME ' etc."""
+    return _header_key(cell).replace(" ", "") == "USERNAME"
+
+
 def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
     sections = []
     for row_idx, row in enumerate(all_values):
         username_cols = [
             c for c, cell in enumerate(row)
-            if cell.strip().upper() == "USERNAME"
+            if _is_username_header(cell)
         ]
         for ucol in username_cols:
             headers = {"USERNAME": ucol}
             for c in range(ucol - 1, max(-1, ucol - 4), -1):
                 if 0 <= c < len(row):
-                    if row[c].strip().upper() == "RANK":
+                    if _header_key(row[c]) == "RANK":
                         headers["RANK"] = c
                         break
             for c in range(ucol + 1, min(len(row), ucol + 9)):
-                v = row[c].strip().upper()
-                if v == "USERNAME":
+                v = _header_key(row[c])
+                if v.replace(" ", "") == "USERNAME":
                     break
-                if v in ("LORE NAME", "LORENAME", "LORE") and "LORE NAME" not in headers:
+                if v in ("LORE NAME", "LORENAME", "LORE", "LORE NAMES") and "LORE NAME" not in headers:
                     headers["LORE NAME"] = c
                 elif v == "EP" and "EP" not in headers:
                     headers["EP"] = c
@@ -241,15 +255,19 @@ async def find_player(
     3. First name match in lore column
     Log can have just username, no lore needed.
     """
-    target = username.strip().lower()
-    target_lore = lore_name.strip().lower() if lore_name else None
+    target = name_key(username)
+    target_loose = loose_key(username)
+    target_lore = name_key(lore_name) or None
     logger.info("Searching for player '%s' (lore: %s)...", username, lore_name or "any")
+    if not target:
+        return None
 
     exact_user_lore: PlayerRow | None = None   # username + lore both match
     exact_user: PlayerRow | None = None         # username matches
     exact_lore_as_user: PlayerRow | None = None # full lore name matches target
     first_name: PlayerRow | None = None         # first name of lore matches target
     other_name: list[PlayerRow] = []            # last/middle name of lore matches target
+    loose_user: list[PlayerRow] = []            # username matches ignoring spaces/_/./-
 
     for sheet_name in config.DETACHMENT_SHEETS:
         try:
@@ -270,7 +288,7 @@ async def find_player(
 
                 for row_idx in range(header_row + 1, len(all_values)):
                     row = all_values[row_idx]
-                    if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                    if username_col < len(row) and _is_username_header(row[username_col]):
                         break
                     if username_col >= len(row):
                         continue
@@ -283,8 +301,8 @@ async def find_player(
                     if not cell_user and not cell_lore:
                         continue
 
-                    cell_user_low = cell_user.lower()
-                    cell_lore_low = cell_lore.lower()
+                    cell_user_low = name_key(cell_user)
+                    cell_lore_low = name_key(cell_lore)
 
                     # 1. Exact username match
                     if cell_user_low == target:
@@ -330,6 +348,10 @@ async def find_player(
                         elif target in lore_parts[1:]:
                             other_name.append(_build_player(row, headers, ws.title, row_idx))
 
+                    # 5. Username equal once separators are ignored ("Smax_hy" vs "Smaxhy")
+                    if cell_user_low != target and target_loose and loose_key(cell_user) == target_loose:
+                        loose_user.append(_build_player(row, headers, ws.title, row_idx))
+
         except Exception:
             logger.exception("Error searching sheet '%s'.", sheet_name)
 
@@ -353,8 +375,41 @@ async def find_player(
         logger.warning("'%s' matches several players' lore names (%s) — not guessing.",
                        username, ", ".join(sorted(names)))
 
+    # 5. Username typed with/without a space, underscore, dot or dash — only if unambiguous
+    if loose_user:
+        names = {name_key(p.username) for p in loose_user}
+        if len(names) == 1:
+            match = max(loose_user, key=lambda p: p.col_ep >= 0)
+            logger.info("Returning loose username match: '%s' in '%s'", match.username, match.sheet_name)
+            return match
+
     logger.warning("Player '%s' not found.", username)
     return None
+
+
+async def suggest_usernames(username: str, cache: SheetCache | None = None, limit: int = 2) -> list[str]:
+    """
+    Closest usernames on the sheet to *username*, for a "did you mean" hint.
+    Never used to award points — only shown to the Data Manager.
+    """
+    target = loose_key(username)
+    if not target:
+        return []
+    names: dict[str, str] = {}
+    for sheet_name in config.DETACHMENT_SHEETS:
+        try:
+            ws, all_values = await _read_sheet(sheet_name, cache)
+        except Exception:
+            continue
+        if ws is None:
+            continue
+        for section in _find_table_sections(all_values):
+            ucol = section["username_col"]
+            for _, row in _section_rows(all_values, section):
+                if ucol < len(row) and row[ucol].strip():
+                    names.setdefault(loose_key(row[ucol]), row[ucol].strip())
+    close = difflib.get_close_matches(target, list(names), n=limit, cutoff=0.75)
+    return [names[k] for k in close]
 
 
 def _section_rows(all_values: list[list[str]], section: dict):
@@ -362,7 +417,7 @@ def _section_rows(all_values: list[list[str]], section: dict):
     ucol = section["username_col"]
     for row_idx in range(section["header_row"] + 1, len(all_values)):
         row = all_values[row_idx]
-        if ucol < len(row) and row[ucol].strip().upper() == "USERNAME":
+        if ucol < len(row) and _is_username_header(row[ucol]):
             break
         yield row_idx, row
 
@@ -373,12 +428,12 @@ def _locate_player(all_values: list[list[str]], player: PlayerRow) -> tuple[int,
     get re-sorted or players are transferred, so don't trust row_index blindly.
     Returns (0-based row index, section) or None if they're gone.
     """
-    target = player.username.strip().lower()
+    target = name_key(player.username)
     candidates = []
     for section in _find_table_sections(all_values):
         ucol = section["username_col"]
         for row_idx, row in _section_rows(all_values, section):
-            if ucol < len(row) and row[ucol].strip().lower() == target:
+            if ucol < len(row) and name_key(row[ucol]) == target:
                 candidates.append((row_idx, section))
     if not candidates:
         return None
@@ -520,7 +575,7 @@ async def _get_section_players(ws, section: dict, all_values: list[list[str]]) -
 
     for row_idx in range(header_row + 1, len(all_values)):
         row = all_values[row_idx]
-        if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+        if username_col < len(row) and _is_username_header(row[username_col]):
             break
         if username_col >= len(row):
             continue
@@ -563,7 +618,7 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     last_data_row = first_data_row
     for row_idx in range(header_row + 1, len(all_values)):
         row = all_values[row_idx]
-        if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+        if username_col < len(row) and _is_username_header(row[username_col]):
             break
         last_data_row = row_idx
 
@@ -993,7 +1048,7 @@ async def _transfer_player_locked(
 
 async def find_all_player_rows(username: str, cache: SheetCache | None = None) -> list[PlayerRow]:
     """Find a player across ALL sheets — returns every row they appear in."""
-    target = username.strip().lower()
+    target = name_key(username)
     found: list[PlayerRow] = []
 
     for sheet_name in config.DETACHMENT_SHEETS:
@@ -1011,15 +1066,15 @@ async def find_all_player_rows(username: str, cache: SheetCache | None = None) -
 
                 for row_idx in range(header_row + 1, len(all_values)):
                     row = all_values[row_idx]
-                    if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                    if username_col < len(row) and _is_username_header(row[username_col]):
                         break
                     if username_col >= len(row):
                         continue
 
-                    cell_user = row[username_col].strip().lower()
+                    cell_user = name_key(row[username_col])
                     cell_lore = ""
                     if lore_col is not None and lore_col < len(row):
-                        cell_lore = row[lore_col].strip().lower()
+                        cell_lore = name_key(row[lore_col])
 
                     # Match by username, full lore name, or first name
                     matched = False
@@ -1080,7 +1135,7 @@ async def _set_exam_checkmark_locked(username: str) -> bool:
 
         all_values = await ws.get_all_values()
         sections = _find_table_sections(all_values)
-        target = username.strip().lower()
+        target = name_key(username)
 
         for section in sections:
             header_row = section["header_row"]
@@ -1094,12 +1149,12 @@ async def _set_exam_checkmark_locked(username: str) -> bool:
 
             for row_idx in range(header_row + 1, len(all_values)):
                 row = all_values[row_idx]
-                if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                if username_col < len(row) and _is_username_header(row[username_col]):
                     break
                 if username_col >= len(row):
                     continue
 
-                cell_user = row[username_col].strip().lower()
+                cell_user = name_key(row[username_col])
                 if cell_user == target:
                     # Set the EXAM checkbox to TRUE
                     await ws.update_cell(row_idx + 1, exam_col + 1, True)
@@ -1112,7 +1167,7 @@ async def _set_exam_checkmark_locked(username: str) -> bool:
 
 async def find_ancillary_player(username: str, cache: SheetCache | None = None) -> PlayerRow | None:
     """Find a player specifically in the Ancillary sheet."""
-    target = username.strip().lower()
+    target = name_key(username)
     for sheet_name in config.DETACHMENT_SHEETS:
         if not _is_ancillary(sheet_name):
             continue
@@ -1130,16 +1185,16 @@ async def find_ancillary_player(username: str, cache: SheetCache | None = None) 
 
             for row_idx in range(header_row + 1, len(all_values)):
                 row = all_values[row_idx]
-                if username_col < len(row) and row[username_col].strip().upper() == "USERNAME":
+                if username_col < len(row) and _is_username_header(row[username_col]):
                     break
                 if username_col >= len(row):
                     continue
 
-                cell_user = row[username_col].strip().lower()
+                cell_user = name_key(row[username_col])
                 lore_col = headers.get("LORE NAME")
                 cell_lore = ""
                 if lore_col is not None and lore_col < len(row):
-                    cell_lore = row[lore_col].strip().lower()
+                    cell_lore = name_key(row[lore_col])
 
                 if cell_user == target or cell_lore == target:
                     return _build_player(row, headers, ws.title, row_idx)
@@ -1160,11 +1215,11 @@ class PlayerAlreadyExists(Exception):
 
 
 def _find_exact_username(all_values: list[list[str]], username: str, ws_title: str) -> PlayerRow | None:
-    target = username.strip().lower()
+    target = name_key(username)
     for section in _find_table_sections(all_values):
         ucol = section["username_col"]
         for row_idx, row in _section_rows(all_values, section):
-            if ucol < len(row) and row[ucol].strip().lower() == target:
+            if ucol < len(row) and name_key(row[ucol]) == target:
                 return _build_player(row, section["headers"], ws_title, row_idx)
     return None
 

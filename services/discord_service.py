@@ -16,6 +16,7 @@ import discord
 import config
 from models.player import ParsedLog, ScanResult
 from parser.log_parser import parse_log
+from parser.names import clean_name, name_key
 from services import database_service as db
 from services import sheets_service as sheets
 
@@ -59,13 +60,30 @@ def lore_matches(log_lore: str, sheet_lore: str) -> bool:
 
 def _username_options(username: str) -> list[str]:
     """
-    Names to try for a log's username. People sometimes paste their whole
-    Discord nickname ("Lore Name | Username"), so try each part, username side first.
+    Names to try for a log's username, best guess first.
+
+    People sometimes paste their whole Discord nickname ("Lore Name | Username"),
+    add their lore name in brackets ("Smaxhy (Jessica)"), or use a dash
+    ("Smaxhy - Jessica"). Try the whole thing, then each part.
     """
-    if "|" not in username:
-        return [username]
-    parts = [p.strip() for p in username.split("|") if p.strip()]
-    return list(reversed(parts)) or [username]
+    options = [username]
+
+    def add(name: str) -> None:
+        name = clean_name(name)
+        if name and name_key(name) not in {name_key(o) for o in options}:
+            options.append(name)
+
+    if "|" in username:
+        options = []  # the whole "A | B" string is never a real username
+        for part in reversed(username.split("|")):
+            add(part)
+    bracket = re.match(r"^(.*?)\s*[(\[](.*?)[)\]]\s*$", username)
+    if bracket:
+        add(bracket.group(1))  # bracket usually holds the lore name — don't search it as a username
+    if re.search(r"\s[-–—/]\s", username):
+        for part in re.split(r"\s[-–—/]\s", username):
+            add(part)
+    return options or [username]
 
 
 def _extract_text(message: discord.Message) -> str:
@@ -77,9 +95,15 @@ def _extract_text(message: discord.Message) -> str:
     """
     parts = []
 
-    # Regular text content
+    # Regular text content. A pinged player shows up as "<@123>" in the raw
+    # text, so swap each ping for that member's server nickname.
     if message.content:
-        parts.append(message.content)
+        content = message.content
+        for user in getattr(message, "mentions", None) or []:
+            name = getattr(user, "display_name", None) or getattr(user, "name", "")
+            if name:
+                content = re.sub(rf"<@!?{user.id}>", lambda _m, n=name: n, content)
+        parts.append(content)
 
     # Embeds (some bots post logs as embeds)
     for embed in message.embeds:
@@ -146,13 +170,13 @@ async def run_scan(
                     parsed.username, parsed.lore_name, parsed.ep, parsed.tp, parsed.mp, message.id)
 
         name_options = _username_options(parsed.username)
-        option_keys = {n.strip().lower() for n in name_options}
+        option_keys = {name_key(n) for n in name_options}
 
         # ── Blacklist check ──────────────────────────────────────
         if option_keys & BLACKLISTED_USERNAMES:
             logger.info("  BLOCKED by username blacklist: '%s'", parsed.username)
             continue
-        if parsed.lore_name and parsed.lore_name.strip().lower() in BLACKLISTED_LORE_NAMES:
+        if parsed.lore_name and name_key(parsed.lore_name) in BLACKLISTED_LORE_NAMES:
             logger.info("  BLOCKED by lore blacklist: '%s'", parsed.lore_name)
             continue
 
@@ -166,7 +190,7 @@ async def run_scan(
                     f"⏭️ **{parsed.username}** excluded from this scan."
                 )
                 continue
-            if parsed.lore_name and parsed.lore_name.strip().lower() in excluded_names:
+            if parsed.lore_name and name_key(parsed.lore_name) in excluded_names:
                 logger.info("  EXCLUDED by lore: '%s'", parsed.lore_name)
                 result.flagged_messages.append(
                     f"⏭️ **{parsed.lore_name}** excluded from this scan."
@@ -220,8 +244,15 @@ async def run_scan(
 
         if player is None:
             result.players_not_found += 1
+            hint = ""
+            try:
+                close = await sheets.suggest_usernames(parsed.username, cache=cache)
+            except Exception:
+                close = []
+            if close:
+                hint = " — closest on sheet: " + ", ".join(f"**{n}**" for n in close)
             result.flagged_messages.append(
-                f"❌ Player not found — Username: **{parsed.username}**"
+                f"❌ Player not found — Username: **{parsed.username}**{hint}"
             )
             continue
 

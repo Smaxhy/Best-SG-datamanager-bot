@@ -36,8 +36,12 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 # Player tabs to search (comma-separated in env).
-_DEFAULT_SHEETS = "[D] ROOK,[D] BASTION,[C] ANCILLARY"
-_SHEETS_RAW = os.getenv("PLAYER_SHEETS", _DEFAULT_SHEETS)
+# Default covers every player tab; tabs that don't exist are simply skipped.
+_DEFAULT_SHEETS = (
+    "[D] ROOK,[D] BASTION,[C] ANCILLARY,[S] PEACEKEEPER,[U] MEDICAL,[U] RESEARCH,"
+    "[U] CANNONEER,[U] VALKYRIE,COMMAND,J. COMMAND,QUARTERMASTER,DEVICE WIELDERS"
+)
+_SHEETS_RAW = (os.getenv("PLAYER_SHEETS") or "").strip() or _DEFAULT_SHEETS
 DETACHMENT_SHEETS: list[str] = [s.strip() for s in _SHEETS_RAW.split(",") if s.strip()]
 
 # ── Scan settings ────────────────────────────────────────────────────
