@@ -31,6 +31,18 @@ class PlayerRow:
 
 
 @dataclass
+class ScanIssue:
+    """A log the scan couldn't credit, kept in structured form so /fix can act on it."""
+    kind: str                       # "not_found" | "lore_mismatch"
+    username: str                   # as written in the log (after cleanup)
+    lore_name: str | None           # as written in the log
+    message_id: int = 0
+    jump_url: str = ""
+    player: "PlayerRow | None" = None          # sheet row (lore_mismatch only)
+    suggestions: list = field(default_factory=list)  # close usernames (not_found only)
+
+
+@dataclass
 class ScanResult:
     """Aggregated numbers for the final summary embed."""
     channel_name: str = ""
@@ -47,3 +59,4 @@ class ScanResult:
     tp_added: int = 0
     mp_added: int = 0
     flagged_messages: list = field(default_factory=list)
+    issues: list = field(default_factory=list)  # list[ScanIssue]
