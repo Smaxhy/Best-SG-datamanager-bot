@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import discord
 
 import config
-from models.player import ParsedLog, ScanResult
+from models.player import ParsedLog, ScanIssue, ScanResult
 from parser.log_parser import parse_log
 from parser.names import clean_name, name_key
 from services import database_service as db
@@ -254,6 +254,14 @@ async def run_scan(
             result.flagged_messages.append(
                 f"❌ Player not found — Username: **{parsed.username}**{hint}"
             )
+            result.issues.append(ScanIssue(
+                kind="not_found",
+                username=parsed.username,
+                lore_name=parsed.lore_name,
+                message_id=message.id,
+                jump_url=getattr(message, "jump_url", ""),
+                suggestions=close,
+            ))
             continue
 
         # ── Ranklock check — skip stat updates for locked players ──
@@ -314,6 +322,14 @@ async def run_scan(
                     f"⚠️ Lore mismatch for **{parsed.username}** — "
                     f"Sheet: *{player.lore_name}* / Log: *{parsed.lore_name}*"
                 )
+                result.issues.append(ScanIssue(
+                    kind="lore_mismatch",
+                    username=parsed.username,
+                    lore_name=parsed.lore_name,
+                    message_id=message.id,
+                    jump_url=getattr(message, "jump_url", ""),
+                    player=player,
+                ))
                 continue
 
         # ── Validate rank (informational only) ───────────────────

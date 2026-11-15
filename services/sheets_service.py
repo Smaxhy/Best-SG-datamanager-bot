@@ -1202,6 +1202,71 @@ async def find_ancillary_player(username: str, cache: SheetCache | None = None) 
     return None
 
 
+# ── Fix helpers (used by /fix) ───────────────────────────────────────
+
+async def find_players_by_lore(lore_name: str, cache: SheetCache | None = None) -> list[PlayerRow]:
+    """Every row on every tab whose full lore name equals *lore_name* (formatting ignored)."""
+    target = name_key(lore_name)
+    found: list[PlayerRow] = []
+    if not target:
+        return found
+    for sheet_name in config.DETACHMENT_SHEETS:
+        try:
+            ws, all_values = await _read_sheet(sheet_name, cache)
+        except Exception:
+            logger.exception("Could not read '%s' while searching lore names.", sheet_name)
+            continue
+        if ws is None:
+            continue
+        for section in _find_table_sections(all_values):
+            ucol = section["username_col"]
+            lcol = section["headers"].get("LORE NAME")
+            if lcol is None:
+                continue
+            for row_idx, row in _section_rows(all_values, section):
+                if lcol < len(row) and ucol < len(row) and row[ucol].strip() and name_key(row[lcol]) == target:
+                    found.append(_build_player(row, section["headers"], ws.title, row_idx))
+    return found
+
+
+async def update_player_names(
+    player: PlayerRow, *, username: str | None = None, lore_name: str | None = None
+) -> None:
+    """
+    Overwrite a player's USERNAME and/or LORE NAME cell. Re-reads the tab first
+    and finds the row again, so a re-sort since the lookup can't hit the wrong row.
+    """
+    async with _write_lock:
+        ws = await _get_worksheet_safe(player.sheet_name)
+        if ws is None:
+            raise RuntimeError(f"Cannot find sheet '{player.sheet_name}'")
+        all_values = await ws.get_all_values()
+        found = _locate_player(all_values, player)
+        if found is None:
+            raise RuntimeError(f"**{player.username}** is no longer in **{player.sheet_name}**.")
+        row_idx, section = found
+        headers = section["headers"]
+        cells = []
+        if username is not None:
+            cells.append(gspread.Cell(row=row_idx + 1, col=headers["USERNAME"] + 1, value=username))
+        if lore_name is not None:
+            if "LORE NAME" not in headers:
+                raise RuntimeError(f"No LORE NAME column for **{player.username}** in **{player.sheet_name}**.")
+            cells.append(gspread.Cell(row=row_idx + 1, col=headers["LORE NAME"] + 1, value=lore_name))
+        if cells:
+            await ws.update_cells(cells, value_input_option="RAW")
+            logger.info("Updated names for %s in [%s] row %d: username=%s lore=%s",
+                        player.username, player.sheet_name, row_idx + 1, username, lore_name)
+
+
+def ancillary_sheet_name() -> str:
+    """The Ancillary tab new players go on."""
+    for name in config.DETACHMENT_SHEETS:
+        if _is_ancillary(name):
+            return name
+    return "[C] ANCILLARY"
+
+
 # ── Add player to any sheet ─────────────────────────────────────────
 
 class PlayerAlreadyExists(Exception):
