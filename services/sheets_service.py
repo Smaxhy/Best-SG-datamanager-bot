@@ -1417,6 +1417,85 @@ async def update_player_names(
                         player.username, player.sheet_name, row_idx + 1, username, lore_name)
 
 
+async def all_tab_titles() -> list[str]:
+    """Every tab in the spreadsheet, searched or not."""
+    ss = await _get_spreadsheet()
+    return [ws.title for ws in await ss.worksheets()]
+
+
+def _a1(row_idx: int, col_idx: int) -> str:
+    """0-based (row, col) -> 'B7'."""
+    col, letters = col_idx + 1, ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        letters = chr(65 + rem) + letters
+    return f"{letters}{row_idx + 1}"
+
+
+async def find_name_anywhere(name: str, cache: SheetCache | None = None) -> list[str]:
+    """
+    Every cell on every tab (not just the player tabs, not just recognised
+    tables) whose text is *name*, as 'TAB!A1'. A last check before adding
+    someone, so a table the bot can't read doesn't lead to a duplicate.
+    """
+    target = name_key(name)
+    if not target:
+        return []
+    cache = cache or SheetCache()
+    hits: list[str] = []
+    for title in await all_tab_titles():
+        try:
+            ws, values = await cache.read(title)
+        except Exception:
+            logger.exception("Could not read '%s' while checking for %s.", title, name)
+            continue
+        for r, row in enumerate(values or []):
+            for c, cell in enumerate(row):
+                if cell and name_key(str(cell)) == target:
+                    hits.append(f"{title}!{_a1(r, c)}")
+    return hits
+
+
+async def describe_sheets() -> dict:
+    """What the bot sees: tabs, tables, columns, player counts, duplicate usernames."""
+    cache = SheetCache()
+    titles = await all_tab_titles()
+    searched = {t.strip().lower() for t in config.DETACHMENT_SHEETS}
+    report = {"tabs": [], "missing": [], "duplicates": {}}
+    seen: dict[str, list[str]] = {}
+
+    present = {t.strip().lower() for t in titles}
+    report["missing"] = [t for t in config.DETACHMENT_SHEETS if t.strip().lower() not in present]
+
+    for title in titles:
+        entry = {"title": title, "searched": title.strip().lower() in searched, "tables": [], "error": None}
+        if entry["searched"]:
+            try:
+                ws, values = await cache.read(title)
+                for section in _find_table_sections(values):
+                    players = [
+                        (r, row) for r, row in _section_rows(values, section)
+                        if section["username_col"] < len(row) and str(row[section["username_col"]]).strip()
+                    ]
+                    entry["tables"].append({
+                        "header_cell": _a1(section["header_row"], section["username_col"]),
+                        "columns": {k: _a1(section["header_row"], c)[:-len(str(section["header_row"] + 1))]
+                                    for k, c in sorted(section["headers"].items(), key=lambda kv: kv[1])},
+                        "players": len(players),
+                    })
+                    for r, row in players:
+                        cell = str(row[section["username_col"]]).strip()
+                        seen.setdefault(name_key(cell), []).append(
+                            f"{title}!{_a1(r, section['username_col'])} ({cell})"
+                        )
+            except Exception as exc:
+                entry["error"] = str(exc)
+        report["tabs"].append(entry)
+
+    report["duplicates"] = {k: v for k, v in seen.items() if len(v) > 1}
+    return report
+
+
 def ancillary_sheet_name() -> str:
     """The Ancillary tab new players go on."""
     for name in config.DETACHMENT_SHEETS:
