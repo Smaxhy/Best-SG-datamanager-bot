@@ -16,6 +16,7 @@ import re
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.utils import ValueRenderOption
 from gspread_asyncio import AsyncioGspreadClientManager
 
 import config
@@ -518,7 +519,7 @@ async def apply_stat_changes(
             if not new_values:
                 continue
             cells = [
-                gspread.Cell(row=r + 1, col=c + 1, value=str(v))
+                gspread.Cell(row=r + 1, col=c + 1, value=int(v))
                 for (r, c), v in new_values.items()
             ]
             try:
@@ -566,8 +567,50 @@ def _rank_sort_key(rank_str: str) -> int:
     return RANK_ORDER.get(rank_str.strip().upper(), 99)
 
 
-async def _get_section_players(ws, section: dict, all_values: list[list[str]]) -> list[dict]:
-    """Read all players from a section as dicts with their row data."""
+# Columns that hold checkboxes / whole numbers. Writing "TRUE" or "5" as text
+# (RAW strings) breaks them: checkboxes turn into red-flagged text and number
+# columns stop adding up. Always send real booleans/ints for these.
+CHECKBOX_COLUMNS = {"EXAM", "SCOUTED"}
+NUMBER_COLUMNS = {"EP", "TP", "MP"}
+_INT_RE = re.compile(r"[+-]?\d+(?:\.0+)?")
+
+
+def _coerce_for_write(key: str, value):
+    """Turn text that should be a checkbox or a number back into the real type."""
+    if not isinstance(value, str):
+        if key in NUMBER_COLUMNS and isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+    v = value.strip()
+    if key in CHECKBOX_COLUMNS and v.upper() in ("TRUE", "FALSE"):
+        return v.upper() == "TRUE"
+    if key in NUMBER_COLUMNS and _INT_RE.fullmatch(v):
+        return int(float(v))
+    return value
+
+
+async def _read_typed(ws, fallback: list[list]) -> list[list]:
+    """
+    Read the tab's real values (True/False for checkboxes, numbers as numbers,
+    dates as date serials) rather than the text shown on screen, so rewriting
+    rows doesn't turn them into text. Falls back to the text values if needed.
+    """
+    try:
+        typed = await ws.get_values(value_render_option=ValueRenderOption.unformatted)
+    except Exception:
+        logger.warning("Could not read typed values from '%s'; using display text.",
+                       getattr(ws, "title", "?"), exc_info=True)
+        return fallback
+    return typed if typed is not None else fallback
+
+
+async def _get_section_players(
+    ws, section: dict, all_values: list[list[str]], typed_values: list[list] | None = None
+) -> list[dict]:
+    """
+    Read all players from a section as dicts with their row data.
+    Values come from *typed_values* when given (real booleans/numbers).
+    """
     header_row = section["header_row"]
     username_col = section["username_col"]
     headers = section["headers"]
@@ -585,12 +628,11 @@ async def _get_section_players(ws, section: dict, all_values: list[list[str]]) -
             continue
 
         # Read all fields for this player
+        typed_row = typed_values[row_idx] if typed_values is not None and row_idx < len(typed_values) else row
         data = {}
         for key, col in headers.items():
-            if col < len(row):
-                data[key] = row[col].strip()
-            else:
-                data[key] = ""
+            value = typed_row[col] if col < len(typed_row) else ""
+            data[key] = value.strip() if isinstance(value, str) else value
 
         players.append({
             "row_idx": row_idx,
@@ -609,7 +651,8 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     username_col = section["username_col"]
     headers = section["headers"]
 
-    players = await _get_section_players(ws, section, all_values)
+    typed_values = await _read_typed(ws, all_values)
+    players = await _get_section_players(ws, section, all_values, typed_values)
     if not players:
         return
 
@@ -625,14 +668,14 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     # Sort players by rank
     rank_col = headers.get("RANK")
     if rank_col is not None:
-        players.sort(key=lambda p: _rank_sort_key(p["data"].get("RANK", "")))
+        players.sort(key=lambda p: _rank_sort_key(str(p["data"].get("RANK", ""))))
 
     # Build cell updates to rewrite all rows
     updates = []
     for i, player in enumerate(players):
         row_num = first_data_row + i + 1  # 1-based
         for key, col in headers.items():
-            value = player["data"].get(key, "")
+            value = _coerce_for_write(key, player["data"].get(key, ""))
             updates.append(gspread.Cell(row=row_num, col=col + 1, value=value))
 
     # Clear any leftover rows (if section had empty rows between players)
@@ -971,9 +1014,9 @@ async def _transfer_player_locked(
         ("USERNAME", player.username),
         ("LORE NAME", player.lore_name),
         ("RANK", new_rank.strip().upper()),
-        ("EP", str(dest_ep)),
-        ("TP", str(dest_tp)),
-        ("MP", str(dest_mp)),
+        ("EP", int(dest_ep)),
+        ("TP", int(dest_tp)),
+        ("MP", int(dest_mp)),
     ]:
         col = dest_headers.get(key)
         if col is not None:
@@ -1202,6 +1245,48 @@ async def find_ancillary_player(username: str, cache: SheetCache | None = None) 
     return None
 
 
+# ── Repair (used by /repairsheet) ────────────────────────────────────
+
+async def repair_sheet_types(sheet_names: list[str] | None = None) -> dict[str, int]:
+    """
+    Turn text "TRUE"/"FALSE" in checkbox columns back into real checkboxes, and
+    text numbers in EP/TP/MP back into numbers. Only cells that are actually
+    text are rewritten. Returns {tab: cells fixed}; a tab that failed maps to -1.
+    """
+    fixed: dict[str, int] = {}
+    async with _write_lock:
+        for sheet_name in sheet_names or config.DETACHMENT_SHEETS:
+            try:
+                ws = await _get_worksheet_safe(sheet_name)
+                if ws is None:
+                    continue
+                all_values = await ws.get_all_values()
+                typed = await _read_typed(ws, all_values)
+                cells = []
+                for section in _find_table_sections(all_values):
+                    columns = {
+                        key: col for key, col in section["headers"].items()
+                        if key in CHECKBOX_COLUMNS or key in NUMBER_COLUMNS
+                    }
+                    if not columns:
+                        continue
+                    for row_idx, _row in _section_rows(all_values, section):
+                        trow = typed[row_idx] if row_idx < len(typed) else []
+                        for key, col in columns.items():
+                            value = trow[col] if col < len(trow) else ""
+                            new = _coerce_for_write(key, value)
+                            if new is not value and type(new) is not type(value):
+                                cells.append(gspread.Cell(row=row_idx + 1, col=col + 1, value=new))
+                if cells:
+                    await ws.update_cells(cells, value_input_option="RAW")
+                fixed[ws.title] = len(cells)
+                logger.info("Repaired %d cells in '%s'.", len(cells), ws.title)
+            except Exception:
+                logger.exception("Could not repair '%s'.", sheet_name)
+                fixed[sheet_name] = -1
+    return fixed
+
+
 # ── Fix helpers (used by /fix) ───────────────────────────────────────
 
 async def find_players_by_lore(lore_name: str, cache: SheetCache | None = None) -> list[PlayerRow]:
@@ -1368,7 +1453,7 @@ async def _add_player_to_sheet_locked(
     # Stat columns (Rook/Bastion/Ancillary)
     for stat in ("EP", "TP", "MP"):
         if stat in headers:
-            fields.append((stat, "0"))
+            fields.append((stat, 0))
 
     # Apply any extra fields passed from the command (e.g. Device Wielder fields)
     if extra_fields:
@@ -1380,7 +1465,7 @@ async def _add_player_to_sheet_locked(
     for key, value in fields:
         col = headers.get(key)
         if col is not None:
-            updates.append(gspread.Cell(row=dest_row, col=col + 1, value=value))
+            updates.append(gspread.Cell(row=dest_row, col=col + 1, value=_coerce_for_write(key, value)))
 
     if updates:
         await ws.update_cells(updates, value_input_option="RAW")

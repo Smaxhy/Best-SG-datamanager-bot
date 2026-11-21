@@ -16,6 +16,9 @@ class FakeWorksheet:
         self.reads = 0
         self.update_calls: list[list] = []
         self.update_cell_calls: list[tuple] = []
+        # What was actually written (0-based row, col) -> value with its real type,
+        # like Sheets keeps behind the text it displays.
+        self.typed: dict[tuple[int, int], object] = {}
 
     async def get_all_values(self) -> list[list[str]]:
         self.reads += 1
@@ -30,7 +33,17 @@ class FakeWorksheet:
         while len(r) < col:
             r.append("")
         # Sheets reads every cell back as text (checkboxes as "TRUE"/"FALSE")
-        r[col - 1] = str(value).upper() if isinstance(value, bool) else value
+        r[col - 1] = str(value).upper() if isinstance(value, bool) else str(value)
+        self.typed[(row - 1, col - 1)] = value
+
+    async def get_values(self, value_render_option=None, **kwargs) -> list[list]:
+        """UNFORMATTED_VALUE read: written cells keep their real type."""
+        self.reads += 1
+        await asyncio.sleep(0)
+        out = copy.deepcopy(self.values)
+        for (r, c), v in self.typed.items():
+            out[r][c] = v
+        return out
 
     async def update_cells(self, cells, value_input_option=None) -> None:
         await asyncio.sleep(0)
