@@ -31,7 +31,7 @@ def _written(ws):
     return out
 
 
-async def test_resort_keeps_checkboxes_as_real_booleans(monkeypatch):
+async def test_resort_moves_checkboxes_with_their_player(monkeypatch):
     # RCT listed above PVT → the re-sort swaps them
     ws = _anc_with_ticks(
         [["RCT", "Low", "L L", "0", "0", "0", "TRUE", "FALSE"],
@@ -43,24 +43,24 @@ async def test_resort_keeps_checkboxes_as_real_booleans(monkeypatch):
     section = sheets._find_table_sections(all_values)[0]
     await sheets._rewrite_section_sorted(ws, section, all_values)
 
-    out = _written(ws)
-    assert out[(2, 2)] == "High" and out[(3, 2)] == "Low"
-    assert out[(2, 7)] is True and out[(2, 8)] is True     # High's ticks moved with them
-    assert out[(3, 7)] is True and out[(3, 8)] is False    # Low's ticks moved with them
-    assert out[(2, 4)] == 4 and isinstance(out[(2, 4)], int)  # EP stays a number
-    assert not any(isinstance(v, str) and v.upper() in ("TRUE", "FALSE") for v in out.values())
+    assert (ws.cell(2, 2), ws.cell(3, 2)) == ("High", "Low")
+    assert ws.typed[(2, 7)] is True and ws.typed[(2, 8)] is True    # High's ticks moved with them
+    assert ws.typed[(3, 7)] is True and ws.typed[(3, 8)] is False   # Low's ticks moved with them
+    assert ws.update_calls == []  # nothing rewritten as text — Sheets moved the rows
 
 
-async def test_resort_turns_old_text_ticks_back_into_checkboxes(monkeypatch):
+async def test_fallback_resort_writes_real_types_and_repairs_text_ticks(monkeypatch):
     # Text "TRUE" left behind by the old bug (no typed value = text in the cell)
     ws = _anc_with_ticks([["RCT", "A", "A A", "0", "0", "0", "TRUE", "FALSE"],
-                          ["PVT", "B", "B B", "0", "0", "0", "TRUE", ""]], {})
+                          ["PVT", "B", "B B", "4", "0", "0", "TRUE", ""]], {})
     install_sheets(monkeypatch, ws)
     all_values = await ws.get_all_values()
-    await sheets._rewrite_section_sorted(ws, sheets._find_table_sections(all_values)[0], all_values)
+    await sheets._rewrite_section_values(ws, sheets._find_table_sections(all_values)[0], all_values)
     out = _written(ws)
+    assert out[(2, 2)] == "B" and out[(2, 4)] == 4
     assert out[(2, 7)] is True and out[(3, 7)] is True and out[(3, 8)] is False
     assert out[(2, 8)] == ""  # an empty cell stays empty
+    assert not any(isinstance(v, str) and v.upper() in ("TRUE", "FALSE") for v in out.values())
 
 
 async def test_stat_updates_write_numbers(monkeypatch):
