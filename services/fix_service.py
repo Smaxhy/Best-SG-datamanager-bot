@@ -15,6 +15,7 @@ Nothing is written until apply_fixes() is called with the chosen fixes.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from models.player import PlayerRow, ScanIssue
@@ -24,6 +25,14 @@ from services import sheets_service as sheets
 logger = logging.getLogger("bot.fix")
 
 NEW_PLAYER_RANK = "RCT"
+
+# Roblox usernames: 3–20 letters/digits, at most one underscore, not at either end.
+# Anything else ("Training Log", "Rook Event") is a misread line, never a player.
+_ROBLOX_NAME = re.compile(r"^(?=.{3,20}$)[A-Za-z0-9]+(?:_[A-Za-z0-9]+)?$")
+
+
+def looks_like_username(name: str) -> bool:
+    return bool(_ROBLOX_NAME.match(name or ""))
 
 
 @dataclass
@@ -81,6 +90,12 @@ async def build_plan(issues: list[ScanIssue], cache: sheets.SheetCache | None = 
     # ── Not on the sheet ─────────────────────────────────────────
     for group in not_found.values():
         username = clean_name(group[0].username)
+        if not looks_like_username(username):
+            plan.review.append(
+                f"❓ **{username}** — doesn't look like a Roblox username, so the log was "
+                f"probably misread. Not added."
+            )
+            continue
         lores = {name_key(i.lore_name): clean_name(i.lore_name) for i in group if i.lore_name}
 
         if len(lores) > 1:
@@ -92,7 +107,7 @@ async def build_plan(issues: list[ScanIssue], cache: sheets.SheetCache | None = 
         lore = next(iter(lores.values()), "")
 
         # Same lore name already on the sheet under another username → they renamed
-        if lore:
+        if lore and looks_like_username(username):
             rows = await sheets.find_players_by_lore(lore, cache=cache)
             owners = {name_key(r.username) for r in rows}
             if len(owners) == 1:
@@ -120,6 +135,17 @@ async def build_plan(issues: list[ScanIssue], cache: sheets.SheetCache | None = 
             plan.review.append(
                 f"❓ **{username}** — no lore name in the log, so I can't add them. "
                 f"Use `/addlog username:{username}`."
+            )
+            continue
+
+        # Last guard against duplicates: is the name anywhere in the spreadsheet,
+        # even in a table or tab the bot can't read properly?
+        found_at = await sheets.find_name_anywhere(username, cache=cache)
+        if found_at:
+            where = ", ".join(found_at[:3]) + (" …" if len(found_at) > 3 else "")
+            plan.review.append(
+                f"❓ **{username}** — already on the sheet at {where}, but the bot couldn't "
+                f"read them there. Not added (that would make a duplicate)."
             )
             continue
 

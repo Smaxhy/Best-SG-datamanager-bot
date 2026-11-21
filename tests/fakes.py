@@ -146,7 +146,11 @@ def install_sheets(monkeypatch, *worksheets: FakeWorksheet) -> dict[str, FakeWor
         await asyncio.sleep(0)
         ws.sort_range(start_row, end_row, start_col, end_col, sort_col)
 
+    async def fake_titles():
+        return list(by_name)
+
     monkeypatch.setattr(sheets_service, "_get_worksheet_safe", fake_get_ws)
+    monkeypatch.setattr(sheets_service, "all_tab_titles", fake_titles)
     monkeypatch.setattr(sheets_service, "_sort_range", fake_sort_range)
     monkeypatch.setattr(sheets_service.config, "DETACHMENT_SHEETS", list(by_name))
     return by_name
