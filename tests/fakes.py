@@ -19,6 +19,11 @@ class FakeWorksheet:
         # What was actually written (0-based row, col) -> value with its real type,
         # like Sheets keeps behind the text it displays.
         self.typed: dict[tuple[int, int], object] = {}
+        # Cell formatting stand-in: (0-based row, col) -> style tag. Real Sheets
+        # keeps formatting on the cell; only a Sheets sort moves it with the data.
+        self.formats: dict[tuple[int, int], str] = {}
+        self.sort_calls: list[tuple] = []
+        self.id = abs(hash(title)) % 10_000
 
     async def get_all_values(self) -> list[list[str]]:
         self.reads += 1
@@ -35,6 +40,34 @@ class FakeWorksheet:
         # Sheets reads every cell back as text (checkboxes as "TRUE"/"FALSE")
         r[col - 1] = str(value).upper() if isinstance(value, bool) else str(value)
         self.typed[(row - 1, col - 1)] = value
+
+    def sort_range(self, start_row, end_row, start_col, end_col, sort_col) -> None:
+        """Mimic Sheets' sortRange: A→Z on sort_col, blanks last, stable; values,
+        real types and formatting all move with their row (within the column span)."""
+        self.sort_calls.append((start_row, end_row, start_col, end_col, sort_col))
+        cols = range(start_col, end_col + 1)
+
+        def cell(r, c):
+            row = self.values[r] if r < len(self.values) else []
+            return row[c] if c < len(row) else ""
+
+        rows = list(range(start_row, end_row))
+        snapshot = {
+            r: {c: (cell(r, c), self.typed.get((r, c)), self.formats.get((r, c))) for c in cols}
+            for r in rows
+        }
+        key = lambda r: (str(cell(r, sort_col)).strip() == "", str(cell(r, sort_col)).strip().lower())
+        for dest, src in zip(rows, sorted(rows, key=key)):
+            for c in cols:
+                value, typed, fmt = snapshot[src][c]
+                while len(self.values[dest]) <= c:
+                    self.values[dest].append("")
+                self.values[dest][c] = value
+                for store, v in ((self.typed, typed), (self.formats, fmt)):
+                    if v is None:
+                        store.pop((dest, c), None)
+                    else:
+                        store[(dest, c)] = v
 
     async def get_values(self, value_render_option=None, **kwargs) -> list[list]:
         """UNFORMATTED_VALUE read: written cells keep their real type."""
@@ -109,7 +142,12 @@ def install_sheets(monkeypatch, *worksheets: FakeWorksheet) -> dict[str, FakeWor
     async def fake_get_ws(name: str):
         return by_name.get(name)
 
+    async def fake_sort_range(ws, start_row, end_row, start_col, end_col, sort_col):
+        await asyncio.sleep(0)
+        ws.sort_range(start_row, end_row, start_col, end_col, sort_col)
+
     monkeypatch.setattr(sheets_service, "_get_worksheet_safe", fake_get_ws)
+    monkeypatch.setattr(sheets_service, "_sort_range", fake_sort_range)
     monkeypatch.setattr(sheets_service.config, "DETACHMENT_SHEETS", list(by_name))
     return by_name
 

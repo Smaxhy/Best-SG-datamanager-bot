@@ -642,10 +642,88 @@ async def _get_section_players(
     return players
 
 
+def _section_span(all_values: list[list[str]], section: dict) -> tuple[int, int]:
+    """
+    (first col, last col) of a section's table, 0-based inclusive. Covers every
+    labelled column to the right of the known ones (notes, dates, …) up to a
+    blank header or the next table, so whole player rows move together.
+    """
+    header = all_values[section["header_row"]]
+    cols = section["headers"].values()
+    start, end = min(cols), max(cols)
+    other_starts = [
+        min(sec["headers"].values())
+        for sec in _find_table_sections([header])
+        if min(sec["headers"].values()) > end
+    ]
+    limit = min(other_starts) - 1 if other_starts else len(header) - 1
+    while end + 1 <= limit and str(header[end + 1]).strip():
+        end += 1
+    return start, end
+
+
+async def _sort_range(ws, start_row: int, end_row: int, start_col: int, end_col: int, sort_col: int) -> None:
+    """
+    Sort rows [start_row, end_row) × cols [start_col, end_col] by *sort_col*
+    (A→Z, blanks last) using Sheets' own sort — the same as Data → Sort range.
+    Cell formatting, dropdowns and checkboxes move with each row.
+    """
+    ss = await _get_spreadsheet()
+    await ss.batch_update({"requests": [{"sortRange": {
+        "range": {
+            "sheetId": ws.id,
+            "startRowIndex": start_row, "endRowIndex": end_row,
+            "startColumnIndex": start_col, "endColumnIndex": end_col + 1,
+        },
+        "sortSpecs": [{"dimensionIndex": sort_col, "sortOrder": "ASCENDING"}],
+    }}]})
+
+
 async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]) -> None:
     """
-    Read all players in a section, sort by rank (LCPL first, RCT last),
-    then rewrite the rows in order.
+    Sort a section's players by rank (LCPL first, RCT last).
+
+    Uses Sheets' own sort so each player's whole row — values *and* formatting,
+    dropdown chips, checkboxes — moves together. Rewriting values alone left
+    formatting behind, so players ended up in rows styled differently.
+    The A→Z order of the rank names is exactly LCPL, PFC, PVT, RCT; if the
+    section has any other rank text, fall back to rewriting values.
+    """
+    header_row = section["header_row"]
+    username_col = section["username_col"]
+    rank_col = section["headers"].get("RANK")
+
+    player_rows = [
+        row_idx for row_idx, row in _section_rows(all_values, section)
+        if username_col < len(row) and str(row[username_col]).strip()
+    ]
+    if not player_rows or rank_col is None:
+        return
+
+    ranks = {
+        str(all_values[r][rank_col]).strip().upper() if rank_col < len(all_values[r]) else ""
+        for r in player_rows
+    }
+    if ranks <= set(RANK_ORDER) | {""}:  # blanks sort last either way
+        start_col, end_col = _section_span(all_values, section)
+        try:
+            await _sort_range(ws, header_row + 1, player_rows[-1] + 1, start_col, end_col, rank_col)
+            logger.info("Sorted section at row %d (%d players) with Sheets sort.",
+                        header_row + 1, len(player_rows))
+            return
+        except Exception:
+            logger.exception("Sheets sort failed for section at row %d; rewriting values instead.",
+                             header_row + 1)
+    else:
+        logger.info("Section at row %d has non-standard ranks %s; rewriting values.",
+                    header_row + 1, sorted(ranks - set(RANK_ORDER) - {""}))
+    await _rewrite_section_values(ws, section, all_values)
+
+
+async def _rewrite_section_values(ws, section: dict, all_values: list[list[str]]) -> None:
+    """
+    Fallback re-sort: read all players in a section, sort by rank, rewrite the
+    values in order. Formatting stays where it was.
     """
     header_row = section["header_row"]
     username_col = section["username_col"]
@@ -656,14 +734,9 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     if not players:
         return
 
-    # Find the data row range (after header, before next header or end)
+    # Data rows: after the header, down to the last row with a player
     first_data_row = header_row + 1
-    last_data_row = first_data_row
-    for row_idx in range(header_row + 1, len(all_values)):
-        row = all_values[row_idx]
-        if username_col < len(row) and _is_username_header(row[username_col]):
-            break
-        last_data_row = row_idx
+    last_data_row = max(p["row_idx"] for p in players)
 
     # Sort players by rank
     rank_col = headers.get("RANK")
@@ -805,13 +878,13 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
             updates.append(gspread.Cell(row=row_num, col=rank_col + 1, value=new_rank_upper))
         ep_col = headers.get("EP")
         if ep_col is not None:
-            updates.append(gspread.Cell(row=row_num, col=ep_col + 1, value=str(new_ep)))
+            updates.append(gspread.Cell(row=row_num, col=ep_col + 1, value=int(new_ep)))
         tp_col = headers.get("TP")
         if tp_col is not None:
-            updates.append(gspread.Cell(row=row_num, col=tp_col + 1, value=str(new_tp)))
+            updates.append(gspread.Cell(row=row_num, col=tp_col + 1, value=int(new_tp)))
         mp_col = headers.get("MP")
         if mp_col is not None and req and req["mp"] > 0:
-            updates.append(gspread.Cell(row=row_num, col=mp_col + 1, value=str(new_mp)))
+            updates.append(gspread.Cell(row=row_num, col=mp_col + 1, value=int(new_mp)))
 
         if updates:
             await ws.update_cells(updates, value_input_option="RAW")
