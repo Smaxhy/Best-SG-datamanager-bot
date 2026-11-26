@@ -244,6 +244,12 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
     return sections
 
 
+def _num(value):
+    """18.0 -> 18, 18.5 -> 18.5 (and float noise like 18.499999 -> 18.5)."""
+    value = round(float(value), 6)
+    return int(value) if value.is_integer() else value
+
+
 def _build_player(row, headers, ws_title, row_idx) -> PlayerRow:
     def _safe(key, default=""):
         col = headers.get(key)
@@ -252,9 +258,10 @@ def _build_player(row, headers, ws_title, row_idx) -> PlayerRow:
         return row[col].strip() or default
 
     def _safe_int(key):
+        """Points as a number — whole numbers as int, halves etc. kept (18.5 stays 18.5)."""
         v = _safe(key, "0")
         try:
-            return int(float(v))
+            return _num(float(str(v).replace(",", ".")))
         except (ValueError, TypeError):
             return 0
 
@@ -546,7 +553,7 @@ async def apply_stat_changes(
             if not new_values:
                 continue
             cells = [
-                gspread.Cell(row=r + 1, col=c + 1, value=int(v))
+                gspread.Cell(row=r + 1, col=c + 1, value=_num(v))
                 for (r, c), v in new_values.items()
             ]
             try:
@@ -599,20 +606,20 @@ def _rank_sort_key(rank_str: str) -> int:
 # columns stop adding up. Always send real booleans/ints for these.
 CHECKBOX_COLUMNS = {"EXAM", "SCOUTED"}
 NUMBER_COLUMNS = {"EP", "TP", "MP"}
-_INT_RE = re.compile(r"[+-]?\d+(?:\.0+)?")
+_NUM_RE = re.compile(r"[+-]?\d+(?:[.,]\d+)?")
 
 
 def _coerce_for_write(key: str, value):
     """Turn text that should be a checkbox or a number back into the real type."""
     if not isinstance(value, str):
-        if key in NUMBER_COLUMNS and isinstance(value, float) and value.is_integer():
-            return int(value)
+        if key in NUMBER_COLUMNS and isinstance(value, float):
+            return _num(value)
         return value
     v = value.strip()
     if key in CHECKBOX_COLUMNS and v.upper() in ("TRUE", "FALSE"):
         return v.upper() == "TRUE"
-    if key in NUMBER_COLUMNS and _INT_RE.fullmatch(v):
-        return int(float(v))
+    if key in NUMBER_COLUMNS and _NUM_RE.fullmatch(v):
+        return _num(float(v.replace(",", ".")))
     return value
 
 
@@ -866,13 +873,13 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
             updates.append(gspread.Cell(row=row_num, col=rank_col + 1, value=new_rank_upper))
         ep_col = headers.get("EP")
         if ep_col is not None:
-            updates.append(gspread.Cell(row=row_num, col=ep_col + 1, value=int(new_ep)))
+            updates.append(gspread.Cell(row=row_num, col=ep_col + 1, value=_num(new_ep)))
         tp_col = headers.get("TP")
         if tp_col is not None:
-            updates.append(gspread.Cell(row=row_num, col=tp_col + 1, value=int(new_tp)))
+            updates.append(gspread.Cell(row=row_num, col=tp_col + 1, value=_num(new_tp)))
         mp_col = headers.get("MP")
         if mp_col is not None and req and req["mp"] > 0:
-            updates.append(gspread.Cell(row=row_num, col=mp_col + 1, value=int(new_mp)))
+            updates.append(gspread.Cell(row=row_num, col=mp_col + 1, value=_num(new_mp)))
 
         if updates:
             await ws.update_cells(updates, value_input_option="RAW")
@@ -882,6 +889,95 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
 
     result = req_msg + f"\n\nRank: **{player.rank}** → **{new_rank_upper}**"
     return result
+
+
+# ── Row formatting ───────────────────────────────────────────────────
+# The bot writes values only, so a player put in a row that was never styled
+# (below where the sheet's formatting was pasted) shows in plain Arial. After
+# placing someone, copy the formatting most of that table's players have.
+
+def _style_key(fmt: dict | None) -> tuple:
+    """What makes a name cell look a certain way: font, size, bold, alignment."""
+    fmt = fmt or {}
+    text = fmt.get("textFormat", {})
+    return (text.get("fontFamily"), text.get("fontSize"), bool(text.get("bold")),
+            fmt.get("horizontalAlignment"))
+
+
+async def _read_formats(ws, col: int, rows: list[int]) -> dict[int, tuple]:
+    """{row_idx: style key} for column *col* on the given 0-based rows."""
+    if not rows:
+        return {}
+    first, last = min(rows), max(rows)
+    rng = f"'{ws.title}'!{_a1(first, col)}:{_a1(last, col)}"
+    ss = await _get_spreadsheet()
+    meta = await ss.fetch_sheet_metadata(params={
+        "includeGridData": "true",
+        "ranges": rng,
+        "fields": "sheets(data(startRow,rowData(values(userEnteredFormat))))",
+    })
+    data = (meta.get("sheets") or [{}])[0].get("data") or [{}]
+    start = data[0].get("startRow", first)
+    out = {}
+    for i, row_data in enumerate(data[0].get("rowData") or []):
+        values = row_data.get("values") or [{}]
+        out[start + i] = _style_key(values[0].get("userEnteredFormat"))
+    return {r: out.get(r, _style_key(None)) for r in rows}
+
+
+async def _copy_format(ws, src_row: int, dst_rows: list[int], start_col: int, end_col: int) -> None:
+    """Paste *src_row*'s formatting (incl. dropdowns/checkboxes) onto *dst_rows*, within the table's columns."""
+    def grid(r):
+        return {"sheetId": ws.id, "startRowIndex": r, "endRowIndex": r + 1,
+                "startColumnIndex": start_col, "endColumnIndex": end_col + 1}
+    ss = await _get_spreadsheet()
+    await ss.batch_update({"requests": [
+        {"copyPaste": {"source": grid(src_row), "destination": grid(r), "pasteType": "PASTE_FORMAT"}}
+        for r in dst_rows
+    ]})
+
+
+def _majority_style(styles: dict[int, tuple]) -> tuple[tuple, int] | None:
+    """(style, a row that has it) if more than half the rows share one style; else None."""
+    if len(styles) < 2:
+        return None
+    counts: dict[tuple, list[int]] = {}
+    for r, key in styles.items():
+        counts.setdefault(key, []).append(r)
+    key, rows = max(counts.items(), key=lambda kv: len(kv[1]))
+    if len(rows) * 2 <= len(styles):
+        return None
+    return key, rows[0]
+
+
+async def _restyle_rows(ws, section: dict, all_values: list[list[str]],
+                        only: list[int] | None = None) -> list[int]:
+    """
+    Give rows in a table the formatting most of its players have. *only*
+    limits which rows may be changed (e.g. a newly placed player). Returns the
+    0-based rows restyled. Never raises — formatting is cosmetic.
+    """
+    try:
+        ucol = section["username_col"]
+        rows = [r for r, row in _section_rows(all_values, section)
+                if ucol < len(row) and str(row[ucol]).strip()]
+        targets = set(only) if only is not None else set(rows)
+        reference = [r for r in rows if r not in (set(only) if only is not None else set())]
+        styles = await _read_formats(ws, ucol, sorted(set(reference) | targets))
+        majority = _majority_style({r: styles[r] for r in reference})
+        if majority is None:
+            return []
+        key, src = majority
+        fix = sorted(r for r in targets if styles.get(r) != key)
+        if fix:
+            start, end = _section_span(all_values, section)
+            await _copy_format(ws, src, fix, start, end)
+            logger.info("Restyled rows %s in '%s' to match row %d.",
+                        [r + 1 for r in fix], ws.title, src + 1)
+        return fix
+    except Exception:
+        logger.warning("Could not match row formatting in '%s'.", getattr(ws, "title", "?"), exc_info=True)
+        return []
 
 
 def _row_is_empty(row: list[str], section: dict) -> bool:
@@ -1124,9 +1220,9 @@ async def _transfer_player_locked(
         ("USERNAME", player.username),
         ("LORE NAME", player.lore_name),
         ("RANK", new_rank.strip().upper()),
-        ("EP", int(dest_ep)),
-        ("TP", int(dest_tp)),
-        ("MP", int(dest_mp)),
+        ("EP", _num(dest_ep)),
+        ("TP", _num(dest_tp)),
+        ("MP", _num(dest_mp)),
     ]:
         col = dest_headers.get(key)
         if col is not None:
@@ -1140,12 +1236,13 @@ async def _transfer_player_locked(
         logger.warning("Transferred %s but could not clear their old row in %s.",
                        player.username, player.sheet_name)
 
-    # Reorder destination section by rank
+    # Match the table's formatting, then reorder by rank
     all_values = await ws_dest.get_all_values()
     for section in _find_table_sections(all_values):
         if (section["header_row"], section["username_col"]) == (
             dest_section["header_row"], dest_section["username_col"]
         ):
+            await _restyle_rows(ws_dest, section, all_values, only=[dest_row - 1])
             await _rewrite_section_sorted(ws_dest, section, all_values)
             break
 
@@ -1358,6 +1455,29 @@ async def find_ancillary_player(username: str, cache: SheetCache | None = None) 
 
 
 # ── Repair (used by /repairsheet) ────────────────────────────────────
+
+async def repair_row_formatting(sheet_names: list[str] | None = None) -> dict[str, list[int]]:
+    """
+    In every table, give player rows styled differently from most of that
+    table's players (e.g. plain Arial rows at the bottom) the majority style.
+    Returns {tab: [1-based rows changed]}.
+    """
+    changed: dict[str, list[int]] = {}
+    async with _write_lock:
+        for sheet_name in sheet_names or config.DETACHMENT_SHEETS:
+            try:
+                ws = await _get_worksheet_safe(sheet_name)
+                if ws is None:
+                    continue
+                all_values = await ws.get_all_values()
+                rows: list[int] = []
+                for section in _find_table_sections(all_values):
+                    rows += [r + 1 for r in await _restyle_rows(ws, section, all_values)]
+                changed[ws.title] = sorted(rows)
+            except Exception:
+                logger.exception("Could not repair formatting in '%s'.", sheet_name)
+    return changed
+
 
 async def repair_sheet_types(sheet_names: list[str] | None = None) -> dict[str, int]:
     """
@@ -1660,6 +1780,7 @@ async def _add_player_to_sheet_locked(
 
     if updates:
         await ws.update_cells(updates, value_input_option="RAW")
+        await _restyle_rows(ws, dest_section, all_values, only=[dest_row - 1])
 
     location = f"{sheet_name} → {subdivision}" if subdivision else sheet_name
     logger.info("Added player %s (%s) to %s row %d", username, lore_name, location, dest_row)
