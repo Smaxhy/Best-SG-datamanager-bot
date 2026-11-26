@@ -251,6 +251,7 @@ async def test_rewrite_section_sorted_orders_by_rank_and_compacts(monkeypatch):
         ["LCPL", "L", "", "1", "0", "0"],
         ["PVT", "P", "", "2", "0", "0"],
     ])
+    install_sheets(monkeypatch, ws)
     section = sheets._find_table_sections(ws.values)[0]
     await sheets._rewrite_section_sorted(ws, section, await ws.get_all_values())
     assert [ws.cell(r, 6) for r in range(2, 7)] == ["L", "P", "R", "", ""]
@@ -259,7 +260,7 @@ async def test_rewrite_section_sorted_orders_by_rank_and_compacts(monkeypatch):
     assert ws.cell(1, 15) == "USERNAME"
 
 
-async def test_promote_rank_deducts_points_and_resorts(monkeypatch):
+async def test_promote_rank_deducts_points_and_touches_only_that_row(monkeypatch):
     ws = rook_sheet(charlie=[
         ["RCT", "A", "Al", "0", "0", "0"],
         ["PVT", "Bob", "Bob J", "10", "5", "1"],
@@ -269,11 +270,14 @@ async def test_promote_rank_deducts_points_and_resorts(monkeypatch):
     bob = await sheets.find_player("Bob")
     msg = await sheets.promote_rank(bob, "pfc")
     assert "Rank: **PVT** → **PFC**" in msg
+    # Bob is promoted where he stands; nobody else's row moves
     assert _section_rows(ws, 6, count=3) == [
-        ("LCPL", "C", "0", "0"),
-        ("PFC", "Bob", "1", "1"),
         ("RCT", "A", "0", "0"),
+        ("PFC", "Bob", "1", "1"),
+        ("LCPL", "C", "0", "0"),
     ]
+    assert ws.sort_calls == []
+    assert {c.row for call in ws.update_calls for c in call} == {4}
     # MP isn't part of the PFC requirement, so it's left alone
     assert ws.cell(3, 10) == "1"
 
@@ -540,7 +544,7 @@ async def test_promote_uses_players_current_row(monkeypatch):
     bob = await sheets.find_player("Bob")
     ws.values[2], ws.values[3] = ws.values[3], ws.values[2]  # rows moved since lookup
     await sheets.promote_rank(bob, "PFC")
-    assert _section_rows(ws, 6, count=2) == [("PFC", "Bob", "1", "1"), ("RCT", "Al", "0", "0")]
+    assert _section_rows(ws, 6, count=2) == [("RCT", "Al", "0", "0"), ("PFC", "Bob", "1", "1")]
 
 
 async def test_clear_row_does_not_wipe_someone_else_after_resort(monkeypatch):

@@ -16,7 +16,7 @@ from discord import app_commands
 
 import config
 from services.database_service import init_db
-from commands import scan, stats, leaderboard, promote, say, listscan, logs, manage, deathlog, examcheck, purge, trainingban, addlog, fix, repairsheet, sheetcheck
+from commands import scan, stats, leaderboard, promote, say, listscan, logs, manage, deathlog, examcheck, purge, trainingban, addlog, fix, repairsheet, sheetcheck, fieldpromo
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -86,6 +86,7 @@ class DataManagerBot(discord.Client):
         fix.register(self.tree, self)
         repairsheet.register(self.tree, self)
         sheetcheck.register(self.tree, self)
+        fieldpromo.register(self.tree, self)
 
         # Sync globally only
         await self.tree.sync()

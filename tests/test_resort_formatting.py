@@ -88,24 +88,25 @@ async def test_gaps_between_players_close_up(monkeypatch):
     assert [ws.cell(r, 6) for r in (2, 3, 4)] == ["B", "A", ""]
 
 
-async def test_unknown_rank_falls_back_to_rewriting_values(monkeypatch):
+async def test_unknown_rank_leaves_table_alone(monkeypatch):
     ws = bastion_sheet(alpha=[["CPL", "Odd", "O O", "0", "0", "0"], ["PVT", "Norm", "N N", "0", "0", "0"]])
     install_sheets(monkeypatch, ws)
     await _resort(ws)
-    assert ws.sort_calls == []
-    assert (ws.cell(2, 6), ws.cell(3, 6)) == ("Norm", "Odd")  # unknown rank still goes last
+    assert ws.sort_calls == [] and ws.update_calls == []
+    assert (ws.cell(2, 6), ws.cell(3, 6)) == ("Odd", "Norm")
 
 
-async def test_sheets_sort_failure_falls_back(monkeypatch):
+async def test_sheets_sort_failure_leaves_table_alone(monkeypatch):
     ws = rook_sheet(charlie=[["RCT", "A", "A A", "0", "0", "0"], ["PVT", "B", "B B", "0", "0", "0"]])
     install_sheets(monkeypatch, ws)
 
     async def boom(*a, **k):
-        raise RuntimeError("API down")
+        raise RuntimeError("You can't sort a range with merged cells")
 
     monkeypatch.setattr(sheets, "_sort_range", boom)
     await _resort(ws)
-    assert (ws.cell(2, 6), ws.cell(3, 6)) == ("B", "A")
+    assert ws.update_calls == []  # no copying values between rows
+    assert (ws.cell(2, 6), ws.cell(3, 6)) == ("A", "B")
 
 
 async def test_promote_writes_points_as_numbers(monkeypatch):
