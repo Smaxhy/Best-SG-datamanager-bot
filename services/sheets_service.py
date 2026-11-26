@@ -171,6 +171,31 @@ def _is_username_header(cell: str) -> bool:
     return _header_key(cell).replace(" ", "") == "USERNAME"
 
 
+def _assign_spans(header: list[str], row_sections: list[dict]) -> None:
+    """
+    Give each table on a header row its column span: from its first known
+    column to the last labelled header cell before a blank or the next table.
+    """
+    row_sections.sort(key=lambda sec: min(sec["headers"].values()))
+    for i, sec in enumerate(row_sections):
+        start = min(sec["headers"].values())
+        end = max(sec["headers"].values())
+        limit = (min(row_sections[i + 1]["headers"].values()) - 1
+                 if i + 1 < len(row_sections) else len(header) - 1)
+        while end + 1 <= limit and str(header[end + 1]).strip():
+            end += 1
+        sec["span"] = (start, end)
+
+
+def _ends_section(row: list, section: dict) -> bool:
+    """True if *row* is the header of another table inside this table's columns."""
+    start, end = section.get("span") or (section["username_col"], section["username_col"])
+    for c in range(start, min(end, len(row) - 1) + 1):
+        if _is_username_header(str(row[c])):
+            return True
+    return False
+
+
 def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
     sections = []
     for row_idx, row in enumerate(all_values):
@@ -214,6 +239,8 @@ def _find_table_sections(all_values: list[list[str]]) -> list[dict]:
             })
             logger.info("  Section: row %d, USERNAME col %d, headers=%s",
                        row_idx + 1, ucol, headers)
+        if username_cols:
+            _assign_spans(row, [sec for sec in sections if sec["header_row"] == row_idx])
     return sections
 
 
@@ -289,7 +316,7 @@ async def find_player(
 
                 for row_idx in range(header_row + 1, len(all_values)):
                     row = all_values[row_idx]
-                    if username_col < len(row) and _is_username_header(row[username_col]):
+                    if _ends_section(row, section):
                         break
                     if username_col >= len(row):
                         continue
@@ -418,7 +445,7 @@ def _section_rows(all_values: list[list[str]], section: dict):
     ucol = section["username_col"]
     for row_idx in range(section["header_row"] + 1, len(all_values)):
         row = all_values[row_idx]
-        if ucol < len(row) and _is_username_header(row[ucol]):
+        if _ends_section(row, section):
             break
         yield row_idx, row
 
@@ -618,7 +645,7 @@ async def _get_section_players(
 
     for row_idx in range(header_row + 1, len(all_values)):
         row = all_values[row_idx]
-        if username_col < len(row) and _is_username_header(row[username_col]):
+        if _ends_section(row, section):
             break
         if username_col >= len(row):
             continue
@@ -643,23 +670,11 @@ async def _get_section_players(
 
 
 def _section_span(all_values: list[list[str]], section: dict) -> tuple[int, int]:
-    """
-    (first col, last col) of a section's table, 0-based inclusive. Covers every
-    labelled column to the right of the known ones (notes, dates, …) up to a
-    blank header or the next table, so whole player rows move together.
-    """
-    header = all_values[section["header_row"]]
+    """(first col, last col) of a section's table, 0-based inclusive."""
+    if "span" in section:
+        return section["span"]
     cols = section["headers"].values()
-    start, end = min(cols), max(cols)
-    other_starts = [
-        min(sec["headers"].values())
-        for sec in _find_table_sections([header])
-        if min(sec["headers"].values()) > end
-    ]
-    limit = min(other_starts) - 1 if other_starts else len(header) - 1
-    while end + 1 <= limit and str(header[end + 1]).strip():
-        end += 1
-    return start, end
+    return min(cols), max(cols)
 
 
 async def _sort_range(ws, start_row: int, end_row: int, start_col: int, end_col: int, sort_col: int) -> None:
@@ -711,6 +726,17 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     if odd:
         logger.info("Not sorting section at row %d: non-standard ranks %s.", header_row + 1, odd)
         return
+
+    # Banner/label rows between players ("LANCE CORPORALS") would get shuffled
+    # in with everyone else — leave such tables in the order they're in.
+    players = set(player_rows)
+    for row_idx, row in _section_rows(all_values, section):
+        if row_idx > player_rows[-1]:
+            break
+        if row_idx not in players and not _row_is_empty(row, section):
+            logger.info("Not sorting section at row %d: non-player row %d inside it.",
+                        header_row + 1, row_idx + 1)
+            return
 
     start_col, end_col = _section_span(all_values, section)
     try:
@@ -859,41 +885,91 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
 
 
 def _row_is_empty(row: list[str], section: dict) -> bool:
-    """A row is free if both its USERNAME and LORE NAME cells are blank."""
-    for key in ("USERNAME", "LORE NAME"):
-        col = section["headers"].get(key)
-        if col is not None and col < len(row) and row[col].strip():
-            return False
+    """
+    A row is free only if every cell across the table is blank, apart from
+    template defaults: a rank, 0 points, or an unticked box. Any other text
+    (a divider like "LANCE CORPORALS", a note) means it isn't a player slot.
+    """
+    by_col = {col: key for key, col in section["headers"].items()}
+    start, end = section.get("span") or (min(by_col), max(by_col))
+    for c in range(start, end + 1):
+        v = str(row[c]).strip() if c < len(row) else ""
+        if not v:
+            continue
+        key = by_col.get(c)
+        if key == "RANK" and v.upper() in RANK_ORDER:
+            continue
+        if key in NUMBER_COLUMNS and v in ("0", "0.0"):
+            continue
+        if key in CHECKBOX_COLUMNS and v.upper() == "FALSE":
+            continue
+        return False
     return True
 
 
-def _subdivision_sections(sections: list[dict], sheet_name: str, subdivision: str) -> list[dict]:
+def _label_above(all_values: list[list[str]], section: dict, rows_up: int = 3) -> str:
+    """Text written just above a table (e.g. "CHARLIE SQUAD"), within its columns."""
+    start, end = section.get("span") or (section["username_col"], section["username_col"])
+    parts = []
+    for r in range(max(0, section["header_row"] - rows_up), section["header_row"]):
+        row = all_values[r]
+        parts.extend(str(row[c]) for c in range(start, min(end, len(row) - 1) + 1) if str(row[c]).strip())
+    return " ".join(parts).upper()
+
+
+def _subdivision_sections(
+    sections: list[dict], sheet_name: str, subdivision: str, all_values: list[list[str]] | None = None
+) -> list[dict]:
     """
-    Sections that make up *subdivision* on *sheet_name*, roster tables first.
-    Uses the USERNAME column from SUBDIVISION_MAP; if the sheet layout has
-    shifted and nothing is at that column, falls back to left-to-right order
-    of the roster sections (first subdivision = leftmost).
+    The table(s) for *subdivision* on *sheet_name*. Only roster tables (with
+    EP/TP/MP) count, so a small command table can't be picked. In order:
+      1. a table labelled with the subdivision's name just above it
+         (and not with another subdivision's name too),
+      2. the table whose USERNAME column is at the configured position,
+      3. the n-th roster table left→right, top→bottom.
     """
     subs = SUBDIVISION_MAP.get(sheet_name)
     if not subs or subdivision not in subs:
         return []
-    target_col = subs[subdivision]
-    matches = [sec for sec in sections if sec["username_col"] == target_col]
-    if not matches:
-        roster_cols = sorted({sec["username_col"] for sec in sections if "EP" in sec["headers"]})
-        pos = list(subs).index(subdivision)
-        if pos < len(roster_cols):
-            logger.warning("No USERNAME column at %d for %s → %s; using roster column %d instead.",
-                           target_col, sheet_name, subdivision, roster_cols[pos])
-            matches = [sec for sec in sections if sec["username_col"] == roster_cols[pos]]
-    # A small table (e.g. command staff) can share the column; prefer the one with stats
-    return sorted(matches, key=lambda sec: "EP" not in sec["headers"])
+    roster = [sec for sec in sections if "EP" in sec["headers"]] or list(sections)
+
+    if all_values is not None:
+        others = [name.upper() for name in subs if name != subdivision]
+        labelled = []
+        for sec in roster:
+            label = _label_above(all_values, sec)
+            if subdivision.upper() in label and not any(o in label for o in others):
+                labelled.append(sec)
+        if labelled:
+            return labelled
+
+    by_col = [sec for sec in roster if sec["username_col"] == subs[subdivision]]
+    if by_col:
+        return by_col
+
+    ordered = sorted(roster, key=lambda sec: (sec["username_col"], sec["header_row"]))
+    pos = list(subs).index(subdivision)
+    if pos < len(ordered):
+        logger.warning("No table found for %s → %s by label or column; using roster table %d.",
+                       sheet_name, subdivision, pos + 1)
+        return [ordered[pos]]
+    return []
 
 
 def _first_empty_row(all_values: list[list[str]], sections: list[dict]) -> tuple[int, dict] | None:
-    """(1-based row number, section) of the first free row in the given sections."""
+    """
+    (1-based row number, section) of the first free slot: a gap between
+    players, otherwise the row straight after the last player. Never further
+    down — a table that's full returns None rather than spilling into
+    whatever is below it.
+    """
     for section in sections:
-        for row_idx, row in _section_rows(all_values, section):
+        rows = list(_section_rows(all_values, section))
+        used = [r for r, row in rows if not _row_is_empty(row, section)]
+        last = used[-1] if used else section["header_row"]
+        for row_idx, row in rows:
+            if row_idx > last + 1:
+                break
             if _row_is_empty(row, section):
                 return row_idx + 1, section
     return None
@@ -907,7 +983,7 @@ async def _find_empty_subdivision_row(sheet_name: str, subdivision: str):
     if ws is None:
         return None
     all_values = await ws.get_all_values()
-    sections = _subdivision_sections(_find_table_sections(all_values), sheet_name, subdivision)
+    sections = _subdivision_sections(_find_table_sections(all_values), sheet_name, subdivision, all_values)
     found = _first_empty_row(all_values, sections)
     if found is None:
         return None
@@ -1110,6 +1186,8 @@ async def _transfer_player_locked(
             f"EP/TP/MP reset to 0"
         )
 
+    msg += f"\n📍 Placed in **{dest_sheet}** row **{dest_row}**"
+
     return {
         "message": msg,
         "mode": mode,
@@ -1143,7 +1221,7 @@ async def find_all_player_rows(username: str, cache: SheetCache | None = None) -
 
                 for row_idx in range(header_row + 1, len(all_values)):
                     row = all_values[row_idx]
-                    if username_col < len(row) and _is_username_header(row[username_col]):
+                    if _ends_section(row, section):
                         break
                     if username_col >= len(row):
                         continue
@@ -1226,7 +1304,7 @@ async def _set_exam_checkmark_locked(username: str) -> bool:
 
             for row_idx in range(header_row + 1, len(all_values)):
                 row = all_values[row_idx]
-                if username_col < len(row) and _is_username_header(row[username_col]):
+                if _ends_section(row, section):
                     break
                 if username_col >= len(row):
                     continue
@@ -1262,7 +1340,7 @@ async def find_ancillary_player(username: str, cache: SheetCache | None = None) 
 
             for row_idx in range(header_row + 1, len(all_values)):
                 row = all_values[row_idx]
-                if username_col < len(row) and _is_username_header(row[username_col]):
+                if _ends_section(row, section):
                     break
                 if username_col >= len(row):
                     continue
@@ -1533,12 +1611,12 @@ async def _add_player_to_sheet_locked(
         raise PlayerAlreadyExists(existing)
 
     if subdivision and sheet_name in SUBDIVISION_MAP:
-        targets = _subdivision_sections(sections, sheet_name, subdivision)
+        targets = _subdivision_sections(sections, sheet_name, subdivision, all_values)
         if not targets:
             raise RuntimeError(f"Couldn't find the {subdivision} table in {sheet_name}")
         found = _first_empty_row(all_values, targets)
         if found is None:
-            raise RuntimeError(f"No empty row in {sheet_name} → {subdivision}")
+            raise RuntimeError(f"No empty row in {sheet_name} → {subdivision} — the table is full, add an empty row at the bottom of it")
     else:
         # First section with data columns (EP or DEVICE STATUS) and an empty row.
         # Skip bare command sections (only USERNAME/RANK/LORE NAME).
