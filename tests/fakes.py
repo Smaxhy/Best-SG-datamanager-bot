@@ -23,6 +23,7 @@ class FakeWorksheet:
         # keeps formatting on the cell; only a Sheets sort moves it with the data.
         self.formats: dict[tuple[int, int], str] = {}
         self.sort_calls: list[tuple] = []
+        self.format_copies: list[tuple] = []
         self.id = abs(hash(title)) % 10_000
 
     async def get_all_values(self) -> list[list[str]]:
@@ -149,7 +150,21 @@ def install_sheets(monkeypatch, *worksheets: FakeWorksheet) -> dict[str, FakeWor
     async def fake_titles():
         return list(by_name)
 
+    async def fake_read_formats(ws, col, rows):
+        return {r: ws.formats.get((r, col)) for r in rows}
+
+    async def fake_copy_format(ws, src_row, dst_rows, start_col, end_col):
+        ws.format_copies.append((src_row, list(dst_rows), start_col, end_col))
+        for r in dst_rows:
+            for c in range(start_col, end_col + 1):
+                if (src_row, c) in ws.formats:
+                    ws.formats[(r, c)] = ws.formats[(src_row, c)]
+                else:
+                    ws.formats.pop((r, c), None)
+
     monkeypatch.setattr(sheets_service, "_get_worksheet_safe", fake_get_ws)
+    monkeypatch.setattr(sheets_service, "_read_formats", fake_read_formats)
+    monkeypatch.setattr(sheets_service, "_copy_format", fake_copy_format)
     monkeypatch.setattr(sheets_service, "all_tab_titles", fake_titles)
     monkeypatch.setattr(sheets_service, "_sort_range", fake_sort_range)
     monkeypatch.setattr(sheets_service.config, "DETACHMENT_SHEETS", list(by_name))
