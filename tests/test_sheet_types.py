@@ -49,20 +49,6 @@ async def test_resort_moves_checkboxes_with_their_player(monkeypatch):
     assert ws.update_calls == []  # nothing rewritten as text — Sheets moved the rows
 
 
-async def test_fallback_resort_writes_real_types_and_repairs_text_ticks(monkeypatch):
-    # Text "TRUE" left behind by the old bug (no typed value = text in the cell)
-    ws = _anc_with_ticks([["RCT", "A", "A A", "0", "0", "0", "TRUE", "FALSE"],
-                          ["PVT", "B", "B B", "4", "0", "0", "TRUE", ""]], {})
-    install_sheets(monkeypatch, ws)
-    all_values = await ws.get_all_values()
-    await sheets._rewrite_section_values(ws, sheets._find_table_sections(all_values)[0], all_values)
-    out = _written(ws)
-    assert out[(2, 2)] == "B" and out[(2, 4)] == 4
-    assert out[(2, 7)] is True and out[(3, 7)] is True and out[(3, 8)] is False
-    assert out[(2, 8)] == ""  # an empty cell stays empty
-    assert not any(isinstance(v, str) and v.upper() in ("TRUE", "FALSE") for v in out.values())
-
-
 async def test_stat_updates_write_numbers(monkeypatch):
     tabs = install_sheets(monkeypatch, rook_sheet(charlie=[["PVT", "Smaxhy", "J C", "3", "1", "0"]]))
     p = await sheets.find_player("Smaxhy")

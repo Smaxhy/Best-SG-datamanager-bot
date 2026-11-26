@@ -684,10 +684,13 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
     Sort a section's players by rank (LCPL first, RCT last).
 
     Uses Sheets' own sort so each player's whole row — values *and* formatting,
-    dropdown chips, checkboxes — moves together. Rewriting values alone left
-    formatting behind, so players ended up in rows styled differently.
-    The A→Z order of the rank names is exactly LCPL, PFC, PVT, RCT; if the
-    section has any other rank text, fall back to rewriting values.
+    dropdown chips, checkboxes — moves together. The A→Z order of the rank
+    names is exactly LCPL, PFC, PVT, RCT.
+
+    If that isn't possible (other rank text in the table, or Sheets refuses the
+    sort, e.g. because of merged cells) the table is left exactly as it is.
+    Copying values between rows instead used to leave columns behind and put
+    names next to someone else's data.
     """
     header_row = section["header_row"]
     username_col = section["username_col"]
@@ -704,62 +707,19 @@ async def _rewrite_section_sorted(ws, section: dict, all_values: list[list[str]]
         str(all_values[r][rank_col]).strip().upper() if rank_col < len(all_values[r]) else ""
         for r in player_rows
     }
-    if ranks <= set(RANK_ORDER) | {""}:  # blanks sort last either way
-        start_col, end_col = _section_span(all_values, section)
-        try:
-            await _sort_range(ws, header_row + 1, player_rows[-1] + 1, start_col, end_col, rank_col)
-            logger.info("Sorted section at row %d (%d players) with Sheets sort.",
-                        header_row + 1, len(player_rows))
-            return
-        except Exception:
-            logger.exception("Sheets sort failed for section at row %d; rewriting values instead.",
-                             header_row + 1)
-    else:
-        logger.info("Section at row %d has non-standard ranks %s; rewriting values.",
-                    header_row + 1, sorted(ranks - set(RANK_ORDER) - {""}))
-    await _rewrite_section_values(ws, section, all_values)
-
-
-async def _rewrite_section_values(ws, section: dict, all_values: list[list[str]]) -> None:
-    """
-    Fallback re-sort: read all players in a section, sort by rank, rewrite the
-    values in order. Formatting stays where it was.
-    """
-    header_row = section["header_row"]
-    username_col = section["username_col"]
-    headers = section["headers"]
-
-    typed_values = await _read_typed(ws, all_values)
-    players = await _get_section_players(ws, section, all_values, typed_values)
-    if not players:
+    odd = sorted(ranks - set(RANK_ORDER) - {""})
+    if odd:
+        logger.info("Not sorting section at row %d: non-standard ranks %s.", header_row + 1, odd)
         return
 
-    # Data rows: after the header, down to the last row with a player
-    first_data_row = header_row + 1
-    last_data_row = max(p["row_idx"] for p in players)
-
-    # Sort players by rank
-    rank_col = headers.get("RANK")
-    if rank_col is not None:
-        players.sort(key=lambda p: _rank_sort_key(str(p["data"].get("RANK", ""))))
-
-    # Build cell updates to rewrite all rows
-    updates = []
-    for i, player in enumerate(players):
-        row_num = first_data_row + i + 1  # 1-based
-        for key, col in headers.items():
-            value = _coerce_for_write(key, player["data"].get(key, ""))
-            updates.append(gspread.Cell(row=row_num, col=col + 1, value=value))
-
-    # Clear any leftover rows (if section had empty rows between players)
-    for row_idx in range(first_data_row + len(players), last_data_row + 1):
-        for key, col in headers.items():
-            updates.append(gspread.Cell(row=row_idx + 1, col=col + 1, value=""))
-
-    if updates:
-        await ws.update_cells(updates, value_input_option="RAW")
-
-    logger.info("Reordered section at row %d: %d players sorted by rank", header_row + 1, len(players))
+    start_col, end_col = _section_span(all_values, section)
+    try:
+        await _sort_range(ws, header_row + 1, player_rows[-1] + 1, start_col, end_col, rank_col)
+        logger.info("Sorted section at row %d (%d players) with Sheets sort.",
+                    header_row + 1, len(player_rows))
+    except Exception:
+        logger.exception("Sheets sort failed for section at row %d; left in its current order.",
+                         header_row + 1)
 
 
 # Promotion requirements: what you need to go FROM current rank TO next rank
@@ -831,7 +791,9 @@ def check_promotion_requirements(player: PlayerRow, new_rank: str) -> tuple[bool
 async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) -> str:
     """
     Change a player's rank in their current sheet.
-    Checks requirements, deducts points, then reorders the section.
+    Checks requirements and deducts points (unless *force* — a field promotion,
+    which skips both). Only the player's own RANK/EP/TP/MP cells are written;
+    the table isn't re-sorted, so no one else's row can move.
     Returns a summary message.
     """
     new_rank_upper = new_rank.strip().upper()
@@ -889,12 +851,8 @@ async def promote_rank(player: PlayerRow, new_rank: str, force: bool = False) ->
         if updates:
             await ws.update_cells(updates, value_input_option="RAW")
 
-        # Re-read and reorder the section
-        all_values = await ws.get_all_values()
-        await _rewrite_section_sorted(ws, target_section, all_values)
-
-    logger.info("Promoted %s to %s in [%s], points deducted, section reordered",
-                player.username, new_rank_upper, player.sheet_name)
+    logger.info("Promoted %s to %s in [%s] row %d (force=%s)",
+                player.username, new_rank_upper, player.sheet_name, row_num, force)
 
     result = req_msg + f"\n\nRank: **{player.rank}** → **{new_rank_upper}**"
     return result
@@ -1004,20 +962,22 @@ async def transfer_player(
     dest_sheet: str,
     subdivision: str,
     new_rank: str = "RCT",
+    force: bool = False,
 ) -> dict:
     """
     Move a player from their current sheet to a new detachment/subdivision.
 
     Two modes:
     - Ancillary → Rook/Bastion: ranked PROMOTION — checks requirements,
-      deducts points, keeps remainder.
+      deducts points, keeps remainder. With *force* (field promotion) the
+      requirements are skipped and all points are kept.
     - Rook ↔ Bastion: lateral TRANSFER — keeps all points as-is.
 
     Returns a dict with: message, mode ("promotion"|"transfer"), old_ep/tp/mp,
     new_ep/tp/mp, deducted_ep/tp/mp, old_rank, new_rank.
     """
     async with _write_lock:
-        return await _transfer_player_locked(player, dest_sheet, subdivision, new_rank)
+        return await _transfer_player_locked(player, dest_sheet, subdivision, new_rank, force)
 
 
 async def _transfer_player_locked(
@@ -1025,6 +985,7 @@ async def _transfer_player_locked(
     dest_sheet: str,
     subdivision: str,
     new_rank: str,
+    force: bool = False,
 ) -> dict:
     # Use the player's points as they are in the sheet right now
     ws_src = await _get_worksheet_safe(player.sheet_name)
@@ -1046,7 +1007,7 @@ async def _transfer_player_locked(
         mode = "promotion"
         # Check promotion requirements
         new_rank_upper = new_rank.strip().upper()
-        req = RANK_REQUIREMENTS.get(new_rank_upper)
+        req = None if force else RANK_REQUIREMENTS.get(new_rank_upper)
         if req:
             eligible, req_msg = check_promotion_requirements(player, new_rank_upper)
             if not eligible:
